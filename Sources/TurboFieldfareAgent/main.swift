@@ -2,7 +2,11 @@ import Foundation
 import TurboFieldfare
 import TurboFieldfareCLICore
 
-let rawArgv = Array(CommandLine.arguments.dropFirst())
+var rawArgv = Array(CommandLine.arguments.dropFirst())
+if !rawArgv.contains("--prompt") && !rawArgv.contains("--chat-prompt") && !rawArgv.contains("--messages-file") {
+    rawArgv.append("--prompt")
+    rawArgv.append("agent")
+}
 let args: Args
 do {
     args = try Args.parse(rawArgv)
