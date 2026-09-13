@@ -8,6 +8,7 @@ let package = Package(
         .iOS(.v26),
     ],
     products: [
+        .executable(name: "TurboFieldfareAgent", targets: ["TurboFieldfareAgent"]),
         .library(name: "TurboFieldfare", targets: ["TurboFieldfare"]),
         .executable(name: "TurboFieldfareRepack", targets: ["TurboFieldfareRepack"]),
         .executable(name: "TurboFieldfareCLI", targets: ["TurboFieldfareCLI"]),
@@ -116,6 +117,15 @@ let package = Package(
             name: "TurboFieldfareValidationSupport",
             dependencies: ["TurboFieldfare"],
             path: "Sources/TurboFieldfareValidation/Support"
+        ),
+        .executableTarget(
+            name: "TurboFieldfareAgent",
+            dependencies: [
+                "TurboFieldfare",
+                "TurboFieldfareCLICore",
+                "TurboFieldfareServerCore",
+            ],
+            path: "Sources/TurboFieldfareAgent"
         ),
         .testTarget(
             name: "TurboFieldfareFormatTests",
