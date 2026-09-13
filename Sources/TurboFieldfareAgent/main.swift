@@ -12,7 +12,7 @@ struct AgentCLI {
     static func main() async throws {
         try await run()
     }
-
+    
     nonisolated static func run() async throws {
         var rawArgv = Array(CommandLine.arguments.dropFirst())
         if !rawArgv.contains("--prompt") && !rawArgv.contains("--chat-prompt") && !rawArgv.contains("--messages-file") {
@@ -29,20 +29,7 @@ struct AgentCLI {
             print("error: \(error)")
             exit(2)
         }
-
-        func printColor(_ text: String, color: String) {
-            let colorCode: String
-            switch color {
-            case "green": colorCode = "\u{001B}[32m"
-            case "yellow": colorCode = "\u{001B}[33m"
-            case "blue": colorCode = "\u{001B}[34m"
-            case "reset": colorCode = "\u{001B}[0m"
-            default: colorCode = ""
-
-            print("\(colorCode)\(text)\u{001B}[0m", terminator: "")
-            fflush(stdout)
-        }
-
+        
         let modelURL = URL(fileURLWithPath: args.model)
         let context = try MetalContext()
         let runtime = try args.resolvedRuntimeConfiguration(forceLogitsHead: true, imagePrompt: false)
@@ -85,7 +72,6 @@ struct AgentCLI {
             printColor("\nAgent> ", color: "green")
             guard let userInput = readLine() else { break }
             if userInput.isEmpty { continue }
-
             
             if userInput == "/exit" || userInput == "/quit" { break }
             
@@ -98,7 +84,7 @@ struct AgentCLI {
                 for i in 0..<min(previousPromptIds.count, promptIds.count) {
                     if previousPromptIds[i] == promptIds[i] { matchCount += 1 }
                     else { break }
-    
+                }
                 
                 let start: RawCompletionStart = matchCount > 0 ? .resume(cachedPromptTokens: matchCount) : .reset
                 let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: Set(tools.map { $0.name }))
@@ -137,8 +123,8 @@ struct AgentCLI {
                                     fflush(stdout)
                                 case .toolCall(let call):
                                     state.calls.append(call)
-                    
-                
+                                }
+                            }
                         case .tail(let text):
                             let decoderEvents = (try? decoder.consumeTail(text)) ?? []
                             for dev in decoderEvents {
@@ -146,12 +132,12 @@ struct AgentCLI {
                                     state.content += t
                                     print(t, terminator: "")
                                     fflush(stdout)
-                     else if case .toolCall(let call) = dev {
+                                } else if case .toolCall(let call) = dev {
                                     state.calls.append(call)
-                    
-                
-            
-        
+                                }
+                            }
+                        }
+                    }
                 )
                 
                 _ = try? decoder.finish()
@@ -160,7 +146,7 @@ struct AgentCLI {
                 var hCalls: [GFTokenizer.HistoricalToolCall] = []
                 for call in state.calls {
                     hCalls.append(GFTokenizer.HistoricalToolCall(id: call.id, name: call.name, arguments: call.arguments))
-    
+                }
                 messages.append(GFTokenizer.Message(role: .assistant, content: state.content.isEmpty ? nil : state.content, toolCalls: hCalls, toolCallID: nil, name: nil))
                 
                 previousPromptIds = []
@@ -182,22 +168,35 @@ struct AgentCLI {
                                     process.waitUntilExit()
                                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
                                     resultStr = String(data: data, encoding: .utf8) ?? ""
-                     catch {
+                                } catch {
                                     resultStr = "Error: \(error)"
-                    
-                 else {
+                                }
+                            } else {
                                 resultStr = "Error: invalid arguments"
-                
-             else {
+                            }
+                        } else {
                             resultStr = "Error: unknown tool"
-            
+                        }
                         printColor("\(resultStr)\n", color: "yellow")
                         messages.append(GFTokenizer.Message(role: .tool, content: resultStr, toolCalls: [], toolCallID: call.id, name: call.name))
-        
-     else {
+                    }
+                } else {
                     turnActive = false
-    
-
+                }
+            }
         }
     }
+}
+
+func printColor(_ text: String, color: String) {
+    let colorCode: String
+    switch color {
+    case "green": colorCode = "\u{001B}[32m"
+    case "yellow": colorCode = "\u{001B}[33m"
+    case "blue": colorCode = "\u{001B}[34m"
+    case "reset": colorCode = "\u{001B}[0m"
+    default: colorCode = ""
+    }
+    print("\(colorCode)\(text)\u{001B}[0m", terminator: "")
+    fflush(stdout)
 }
