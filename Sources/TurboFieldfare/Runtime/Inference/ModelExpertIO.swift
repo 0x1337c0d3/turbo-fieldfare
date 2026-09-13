@@ -141,6 +141,26 @@ extension Model {
         }
     }
 
+    public func fetchRoutedExpertsSync(plan: RoutedExpertFetchPlan) throws -> [TensorView] {
+        try ensureLayerOpened(plan.layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }
+        let buffers = try streamer.executeExpertCachePlan(plan.cachePlan)
+        return Self.makeExpertViews(
+            buffers,
+            layer: plan.layer,
+            experts: plan.experts)
+    }
+
+    public func fetchRoutedExpertsSync(layer: Int, experts: [Int]) throws -> [TensorView] {
+        try ensureLayerOpened(layer)
+        let streamer = streamersQueue.sync { streamersBox.streamers[layer]! }
+        let buffers = try streamer.loadExpertsCached(experts: experts)
+        return Self.makeExpertViews(
+            buffers,
+            layer: layer,
+            experts: experts)
+    }
+
     private static func makeExpertViews(
         _ buffers: [(buffer: MTLBuffer, offset: UInt64, size: UInt64)],
         layer: Int,

@@ -283,6 +283,52 @@ public struct PrefillStreamedTileBinding: Sendable, Equatable {
                                              plannedMissSlots: plannedMissSlots)
     }
 
+    public static func fetchBindingForTileSync(model: Model,
+                                               layer: Int,
+                                               tileIndex: Int,
+                                               routes: PrefillMoEGroupedRoutes,
+                                               plannedFetch: RoutedExpertFetchPlan? = nil,
+                                               avoidingSlots: Set<Int> = []) throws
+        -> PrefillStreamedTileFetchResult {
+        let expertIDs = try expertIDs(forTile: tileIndex, routes: routes)
+        let plan = try plannedFetch ?? model.planRoutedExperts(layer: layer,
+                                                               experts: expertIDs,
+                                                               avoidingSlots: avoidingSlots)
+        let views: [TensorView]
+        let usedPlannedFetch: Bool
+        let plannedHits: Int
+        let plannedMissIndices: [Int]
+        let plannedAssignedSlots: [Int]
+        let plannedMissSlots: [Int]
+        if let plan {
+            guard plan.layer == layer, plan.experts == expertIDs else {
+                throw PrefillGroupedRoutedMoEError.invalidStreamedTileBinding(
+                    "preplanned fetch does not match tile \(tileIndex)")
+            }
+            views = try model.fetchRoutedExpertsSync(plan: plan)
+            usedPlannedFetch = true
+            plannedHits = plan.hits
+            plannedMissIndices = plan.misses
+            plannedAssignedSlots = plan.assignedSlots
+            plannedMissSlots = plan.misses.map { plan.assignedSlots[$0] }
+        } else {
+            views = try model.fetchRoutedExpertsSync(layer: layer, experts: expertIDs)
+            usedPlannedFetch = false
+            plannedHits = 0
+            plannedMissIndices = []
+            plannedAssignedSlots = []
+            plannedMissSlots = []
+        }
+        let binding = try PrefillStreamedTileBinding(expertIDs: expertIDs, views: views)
+        return PrefillStreamedTileFetchResult(expertIDs: expertIDs,
+                                             binding: binding,
+                                             usedPlannedFetch: usedPlannedFetch,
+                                             plannedHits: plannedHits,
+                                             plannedMissIndices: plannedMissIndices,
+                                             plannedAssignedSlots: plannedAssignedSlots,
+                                             plannedMissSlots: plannedMissSlots)
+    }
+
     public func validateCoversPairs(_ pairs: [PrefillTokenExpertPair],
                                     pairStart: Int,
                                     pairCount: Int) throws {

@@ -698,7 +698,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             }
         }
 
-        struct LayerPrefillQKVViews {
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                do {
+                    struct LayerPrefillQKVViews {
             let inputNorm: TensorView
             let q: TensorView
             let k: TensorView
@@ -1233,7 +1236,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                     detail: "routed tile scheduler requested pending action without pending tile")
                             }
                         }
-                        let fetch = try await PrefillStreamedTileBinding.fetchBindingForTile(
+                        let fetch = try PrefillStreamedTileBinding.fetchBindingForTileSync(
                             model: model,
                             layer: L,
                             tileIndex: tileIndex,
@@ -1381,6 +1384,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
 
         kv?.advance(by: tokens.count)
         prefillChunkState.markCommitted()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     private func produceToken(token: Int32,
@@ -1397,7 +1406,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             throw PrefillError.prefillCursorMismatch(
                 "produce position \(position) exceeds maxContext \(maxContext)")
         }
-        let D    = UInt32(cfg.hiddenSize)
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                do {
+                    let D    = UInt32(cfg.hiddenSize)
         let FmoE = UInt32(cfg.moeIntermediateSize)
         let eps: Float = 1e-6
         let sqrtHidden = Float(cfg.hiddenSize).squareRoot()
@@ -1769,9 +1781,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let blobs: [TensorView]
             if let plannedFetch {
-                blobs = try await model.fetchRoutedExperts(plan: plannedFetch)
+                blobs = try model.fetchRoutedExpertsSync(plan: plannedFetch)
             } else {
-                blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
+                blobs = try model.fetchRoutedExpertsSync(layer: L, experts: experts)
             }
             let layerIo = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
             totalIoNanos &+= layerIo
@@ -1888,6 +1900,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         }
 
         kv?.advance()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     private func runSync(_ body: (MTLCommandBuffer) -> Void) throws {
