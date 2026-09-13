@@ -15,6 +15,25 @@ struct AgentCLI {
     
     nonisolated static func run() async throws {
         var rawArgv = Array(CommandLine.arguments.dropFirst())
+        
+        var systemPromptPath: String?
+        var agentsFilePath: String?
+        
+        var i = 0
+        while i < rawArgv.count {
+            if rawArgv[i] == "--system-prompt", i + 1 < rawArgv.count {
+                systemPromptPath = rawArgv[i + 1]
+                rawArgv.remove(at: i)
+                rawArgv.remove(at: i)
+            } else if rawArgv[i] == "--agents-file", i + 1 < rawArgv.count {
+                agentsFilePath = rawArgv[i + 1]
+                rawArgv.remove(at: i)
+                rawArgv.remove(at: i)
+            } else {
+                i += 1
+            }
+        }
+        
         if !rawArgv.contains("--prompt") && !rawArgv.contains("--chat-prompt") && !rawArgv.contains("--messages-file") {
             rawArgv.append("--prompt")
             rawArgv.append("agent")
@@ -52,8 +71,24 @@ struct AgentCLI {
         let scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize)
         let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
         
+        var masterSystemPrompt = "You are a native Swift agent. You can execute tools natively.\n"
+        if let path = systemPromptPath {
+            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                masterSystemPrompt = content
+            } else {
+                printColor("Warning: Could not read system prompt at \(path)\n", color: "yellow")
+            }
+        }
+        if let path = agentsFilePath {
+            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                masterSystemPrompt += "\n\n## Agent Guidelines\n\(content)"
+            } else {
+                printColor("Warning: Could not read agents file at \(path)\n", color: "yellow")
+            }
+        }
+        
         var messages: [GFTokenizer.Message] = [
-            GFTokenizer.Message(role: .system, content: "You are a native Swift agent. You can execute tools natively.", toolCalls: [], toolCallID: nil, name: nil)
+            GFTokenizer.Message(role: .system, content: masterSystemPrompt, toolCalls: [], toolCallID: nil, name: nil)
         ]
         
         let tools: [GFTokenizer.FunctionDefinition] = [
