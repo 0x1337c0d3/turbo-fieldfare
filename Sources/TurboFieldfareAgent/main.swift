@@ -28,7 +28,7 @@ struct AgentConfig {
     
     init() throws {
         var rawArgv = Array(CommandLine.arguments.dropFirst())
-        var systemPromptPath: String?
+        var systemPromptPath: String? = "docs/agent/codex_prompt.md"
         var agentsFilePath: String?
         
         var i = 0
