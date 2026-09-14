@@ -16,6 +16,44 @@ func printColor(_ text: String, color: String) {
     fflush(stdout)
 }
 
+typealias ReadlineFunc = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+typealias AddHistoryFunc = @convention(c) (UnsafePointer<CChar>?) -> Void
+
+struct ReadlineWrapper {
+    nonisolated(unsafe) static var readline: ReadlineFunc?
+    nonisolated(unsafe) static var addHistory: AddHistoryFunc?
+    
+    static func setup() {
+        if let handle = dlopen("/usr/lib/libedit.dylib", RTLD_NOW) {
+            if let sym = dlsym(handle, "readline") {
+                readline = unsafeBitCast(sym, to: ReadlineFunc.self)
+            }
+            if let sym = dlsym(handle, "add_history") {
+                addHistory = unsafeBitCast(sym, to: AddHistoryFunc.self)
+            }
+        }
+    }
+    
+    static func read(prompt: String) -> String? {
+        if readline == nil { setup() }
+        
+        if let rl = readline {
+            guard let cStr = rl(prompt) else { return nil }
+            defer { free(cStr) }
+            
+            let str = String(cString: cStr)
+            if !str.isEmpty {
+                addHistory?(cStr)
+            }
+            return str
+        } else {
+            print(prompt, terminator: "")
+            fflush(stdout)
+            return Swift.readLine()
+        }
+    }
+}
+
 final class AgentState: @unchecked Sendable {
     var content = ""
     var calls: [ParsedToolCall] = []
@@ -238,8 +276,8 @@ class AgentSession {
     
     func startRepl() async throws {
         while true {
-            printColor("\nAgent> ", color: "green")
-            guard let userInput = readLine() else { break }
+            let prompt = "\n\u{01}\u{001B}[32m\u{02}Agent> \u{01}\u{001B}[0m\u{02}"
+            guard let userInput = ReadlineWrapper.read(prompt: prompt) else { break }
             if userInput.isEmpty { continue }
             if userInput == "/exit" || userInput == "/quit" { break }
             
