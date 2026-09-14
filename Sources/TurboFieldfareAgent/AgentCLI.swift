@@ -411,6 +411,9 @@ class AgentRuntime {
             var isActive = true
             var hasStartedOutput = false
         }
+        
+        class StopFlag: @unchecked Sendable { var stop = false }
+        let stopFlag = StopFlag()
         let sp = SpinnerState()
         
         let spinnerTask = Task {
@@ -444,6 +447,7 @@ class AgentRuntime {
             context: context,
             scratch: scratch,
             start: start,
+            shouldStop: { stopFlag.stop || Task.isCancelled },
             onProgress: { event in
                 switch event {
                 case .prefill: break
@@ -461,6 +465,7 @@ class AgentRuntime {
                             fflush(stdout)
                         case .toolCall(let call):
                             state.calls.append(call)
+                            stopFlag.stop = true
                         }
                     }
                 case .tail(let text):
@@ -476,6 +481,7 @@ class AgentRuntime {
                             fflush(stdout)
                         } else if case .toolCall(let call) = dev {
                             state.calls.append(call)
+                            stopFlag.stop = true
                         }
                     }
                 }
