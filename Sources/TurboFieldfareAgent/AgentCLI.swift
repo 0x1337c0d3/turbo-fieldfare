@@ -68,7 +68,7 @@ struct ReadlineWrapper {
         
         if let rl = readline {
             guard let cStr = rl(prompt) else { return nil }
-            signal(SIGINT, SIG_DFL)
+            signal(SIGINT, { _ in print("\n[Agent Interrupted]"); exit(130) })
             defer { free(cStr) }
             
             let str = String(cString: cStr)
