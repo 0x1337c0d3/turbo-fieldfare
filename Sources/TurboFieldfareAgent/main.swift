@@ -144,7 +144,12 @@ struct ToolRegistry {
                     try process.run()
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
-                    return String(data: data, encoding: .utf8) ?? ""
+                    var outputStr = String(data: data, encoding: .utf8) ?? ""
+                    let maxLength = 8192
+                    if outputStr.count > maxLength {
+                        outputStr = String(outputStr.prefix(maxLength)) + "\n... (output truncated: too large for context window. please use grep, head, or tail to narrow it down)"
+                    }
+                    return outputStr
                 } catch {
                     return "Error: \(error)"
                 }
@@ -303,27 +308,33 @@ class AgentSession {
             
             var turnActive = true
             while turnActive {
-                let (content, calls) = try await runtime.generate(messages: messages)
-                
-                var hCalls: [GFTokenizer.HistoricalToolCall] = []
-                for call in calls {
-                    hCalls.append(GFTokenizer.HistoricalToolCall(id: call.id, name: call.name, arguments: call.arguments))
-                }
-                messages.append(GFTokenizer.Message(role: .assistant, content: content.isEmpty ? nil : content, toolCalls: hCalls, toolCallID: nil, name: nil))
-                
-                if !calls.isEmpty {
+                do {
+                    let (content, calls) = try await runtime.generate(messages: messages)
+                    var hCalls: [GFTokenizer.HistoricalToolCall] = []
                     for call in calls {
-                        let resultStr = ToolRegistry.execute(call: call)
-                        printColor("\(resultStr)\n", color: "yellow")
-                        messages.append(GFTokenizer.Message(role: .tool, content: resultStr, toolCalls: [], toolCallID: call.id, name: call.name))
+                        hCalls.append(GFTokenizer.HistoricalToolCall(id: call.id, name: call.name, arguments: call.arguments))
                     }
-                } else {
+                    messages.append(GFTokenizer.Message(role: .assistant, content: content.isEmpty ? nil : content, toolCalls: hCalls, toolCallID: nil, name: nil))
+                    
+                    if !calls.isEmpty {
+                        for call in calls {
+                            let resultStr = ToolRegistry.execute(call: call)
+                            printColor("\(resultStr)\n", color: "yellow")
+                            messages.append(GFTokenizer.Message(role: .tool, content: resultStr, toolCalls: [], toolCallID: call.id, name: call.name))
+                        }
+                    } else {
+                        turnActive = false
+                    }
+                } catch {
+                    printColor("\n[Error: \(error)]\n", color: "yellow")
+                    // Pop the offending message so the user can continue
+                    if !messages.isEmpty { messages.removeLast() }
                     turnActive = false
+                }
                 }
             }
         }
     }
-}
 
 // MARK: - Main
 @main
