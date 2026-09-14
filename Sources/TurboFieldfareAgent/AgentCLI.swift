@@ -10,6 +10,7 @@ func printColor(_ text: String, color: String) {
     case "yellow": colorCode = "\u{001B}[33m"
     case "blue": colorCode = "\u{001B}[34m"
     case "reset": colorCode = "\u{001B}[0m"
+    case "gray": colorCode = "\u{001B}[90m"
     default: colorCode = ""
     }
     print("\(colorCode)\(text)\u{001B}[0m", terminator: "")
@@ -25,6 +26,11 @@ struct ReadlineWrapper {
     
     static func setup() {
         if let handle = dlopen("/usr/lib/libedit.dylib", RTLD_NOW) {
+            typealias RlBindFunc = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32
+            if let sym = dlsym(handle, "rl_variable_bind") {
+                let bind = unsafeBitCast(sym, to: RlBindFunc.self)
+                _ = bind("editing-mode", "emacs")
+            }
             if let sym = dlsym(handle, "readline") {
                 readline = unsafeBitCast(sym, to: ReadlineFunc.self)
             }
@@ -38,7 +44,8 @@ struct ReadlineWrapper {
         if readline == nil { setup() }
         
         if let rl = readline {
-            guard let cStr = rl(prompt) else { return nil }
+                        guard let cStr = rl(prompt) else { return nil }
+            signal(SIGINT, SIG_DFL)
             defer { free(cStr) }
             
             let str = String(cString: cStr)
@@ -122,6 +129,13 @@ struct AgentConfig {
 struct ToolRegistry {
     static let definitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
+            name: "invoke_subagent",
+            description: "Spawns a subagent to complete a complex sub-task. Use this to delegate long research or refactoring tasks.",
+            parameters: .object([
+                "prompt": .object(["type": .string("string")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
             name: "code_nav_init",
             description: "Initialize tree-sitter AST index",
             parameters: .object(["reset": .object(["type": .string("string")])])
@@ -164,7 +178,44 @@ struct ToolRegistry {
         )
     ]
     
-    static func execute(call: ParsedToolCall) -> String {
+    static func execute(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
+        if call.name == "invoke_subagent" {
+            var promptStr = ""
+            if case .object(let map) = call.arguments, case .string(let p) = map["prompt"] { promptStr = p }
+            
+            printColor("\n--- [Subagent Started] ---\n", color: "blue")
+            let subSession = AgentSession(runtime: runtime)
+            subSession.messages[0] = GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt + "\n\nYou are a SUBAGENT working on a delegated task. Return the final result clearly.", toolCalls: [], toolCallID: nil, name: nil)
+            subSession.messages.append(GFTokenizer.Message(role: .user, content: promptStr, toolCalls: [], toolCallID: nil, name: nil))
+            
+            var turnActive = true
+            while turnActive {
+                do {
+                    let (content, subCalls) = try await runtime.generate(messages: subSession.messages)
+                    var hCalls: [GFTokenizer.HistoricalToolCall] = []
+                    for c in subCalls { hCalls.append(GFTokenizer.HistoricalToolCall(id: c.id, name: c.name, arguments: c.arguments)) }
+                    subSession.messages.append(GFTokenizer.Message(role: .assistant, content: content.isEmpty ? nil : content, toolCalls: hCalls, toolCallID: nil, name: nil))
+                    if !subCalls.isEmpty {
+                        for c in subCalls {
+                            var argString = ""
+                            if case .object(let map) = c.arguments {
+                                argString = map.keys.joined(separator: ", ")
+                            }
+                            printColor("\n🟢 \(c.name)(\(argString))\n", color: "green")
+                            let rStr = await ToolRegistry.execute(call: c, runtime: runtime)
+                            printColor("   \(rStr.prefix(200))\(rStr.count > 200 ? "..." : "")\n", color: "yellow")
+                            subSession.messages.append(GFTokenizer.Message(role: .tool, content: rStr, toolCalls: [], toolCallID: c.id, name: c.name))
+                        }
+                    } else {
+                        turnActive = false
+                    }
+                } catch {
+                    return "Subagent Error: \(error)"
+                }
+            }
+            printColor("\n--- [Subagent Finished] ---\n", color: "blue")
+            return subSession.messages.last?.content ?? "No output from subagent."
+        }
         if call.name == "code_nav_init" || call.name == "code_symbols" || call.name == "code_query" {
             guard let mcp = MCPClient.shared else { return "Error: MCP Client not initialized" }
             var args: [String: Any] = [:]
@@ -383,8 +434,13 @@ class AgentSession {
                     
                     if !calls.isEmpty {
                         for call in calls {
-                            let resultStr = ToolRegistry.execute(call: call)
-                            printColor("\(resultStr)\n", color: "yellow")
+                            var argString = ""
+                            if case .object(let map) = call.arguments {
+                                argString = map.keys.joined(separator: ", ") // Just show keys for compactness
+                            }
+                            printColor("\n🟢 \(call.name)(\(argString))\n", color: "green")
+                            let resultStr = await ToolRegistry.execute(call: call, runtime: runtime)
+                            printColor("   \(resultStr.prefix(300))\(resultStr.count > 300 ? "..." : "")\n", color: "yellow")
                             messages.append(GFTokenizer.Message(role: .tool, content: resultStr, toolCalls: [], toolCallID: call.id, name: call.name))
                         }
                     } else {
