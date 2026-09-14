@@ -199,7 +199,12 @@ struct ToolRegistry {
                         for c in subCalls {
                             var argString = ""
                             if case .object(let map) = c.arguments {
-                                argString = map.keys.joined(separator: ", ")
+                                if let c = map["command"], case .string(let s) = c { argString = s.replacingOccurrences(of: "\n", with: " ") }
+                                else if let p = map["path"], case .string(let s) = p { argString = s }
+                                else if let q = map["query"], case .string(let s) = q { argString = s }
+                                else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
+                                else { argString = map.keys.joined(separator: ", ") }
+                                if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
                             }
                             printColor("\n🟢 \(c.name)(\(argString))\n", color: "green")
                             let rStr = await ToolRegistry.execute(call: c, runtime: runtime)
@@ -324,9 +329,30 @@ class AgentRuntime {
         let start: RawCompletionStart = matchCount > 0 ? .resume(cachedPromptTokens: matchCount) : .reset
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: Set(ToolRegistry.definitions.map { $0.name }))
         
-        printColor("Generating... ", color: "blue")
+        
         
         let state = AgentState()
+        
+        let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        class SpinnerState: @unchecked Sendable {
+            var isActive = true
+            var hasStartedOutput = false
+        }
+        let sp = SpinnerState()
+        
+        let spinnerTask = Task {
+            var i = 0
+            while sp.isActive && !sp.hasStartedOutput {
+                print("\r\u{001B}[34m\(spinnerFrames[i % spinnerFrames.count]) Thinking...\u{001B}[0m\u{001B}[K", terminator: "")
+                fflush(stdout)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                i += 1
+            }
+            if !sp.hasStartedOutput {
+                print("\r\u{001B}[K", terminator: "")
+                fflush(stdout)
+            }
+        }
         
         _ = try await runRawCompletion(
             producer: runner,
@@ -353,6 +379,10 @@ class AgentRuntime {
                     for dev in decoderEvents {
                         switch dev {
                         case .content(let text):
+                            if !sp.hasStartedOutput {
+                                sp.hasStartedOutput = true
+                                print("\r\u{001B}[K", terminator: "")
+                            }
                             state.content += text
                             print(text, terminator: "")
                             fflush(stdout)
@@ -364,6 +394,10 @@ class AgentRuntime {
                     let decoderEvents = (try? decoder.consumeTail(text)) ?? []
                     for dev in decoderEvents {
                         if case .content(let t) = dev {
+                            if !sp.hasStartedOutput {
+                                sp.hasStartedOutput = true
+                                print("\r\u{001B}[K", terminator: "")
+                            }
                             state.content += t
                             print(t, terminator: "")
                             fflush(stdout)
@@ -375,8 +409,11 @@ class AgentRuntime {
             }
         )
         
+        sp.isActive = false
+        _ = await spinnerTask.result
+        
         _ = try? decoder.finish()
-        print("")
+        if sp.hasStartedOutput { print("") }
         
         self.previousPromptIds = []
         return (state.content, state.calls)
@@ -436,7 +473,12 @@ class AgentSession {
                         for call in calls {
                             var argString = ""
                             if case .object(let map) = call.arguments {
-                                argString = map.keys.joined(separator: ", ") // Just show keys for compactness
+                                if let c = map["command"], case .string(let s) = c { argString = s.replacingOccurrences(of: "\n", with: " ") }
+                                else if let p = map["path"], case .string(let s) = p { argString = s }
+                                else if let q = map["query"], case .string(let s) = q { argString = s }
+                                else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
+                                else { argString = map.keys.joined(separator: ", ") }
+                                if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
                             }
                             printColor("\n🟢 \(call.name)(\(argString))\n", color: "green")
                             let resultStr = await ToolRegistry.execute(call: call, runtime: runtime)
