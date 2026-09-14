@@ -281,7 +281,25 @@ class AgentSession {
             if userInput.isEmpty { continue }
             if userInput == "/exit" || userInput == "/quit" { break }
             
-            messages.append(GFTokenizer.Message(role: .user, content: userInput, toolCalls: [], toolCallID: nil, name: nil))
+            var finalInput = userInput
+            if userInput.hasPrefix("/") {
+                let parts = userInput.split(separator: " ", maxSplits: 1)
+                if let command = parts.first {
+                    let cmdName = String(command.dropFirst())
+                    let args = parts.count > 1 ? String(parts[1]) : ""
+                    
+                    let skillPath = "docs/agent/skills/\(cmdName).md"
+                    if let skillContent = try? String(contentsOfFile: skillPath, encoding: .utf8) {
+                        printColor("[Loaded skill /\(cmdName) from \(skillPath)]\n", color: "blue")
+                        finalInput = "[Skill: \(cmdName)]\n\(skillContent)\n\nUser Request:\n\(args)"
+                    } else {
+                        printColor("Warning: Skill '/\(cmdName)' not found at \(skillPath)\n", color: "yellow")
+                        continue
+                    }
+                }
+            }
+            
+            messages.append(GFTokenizer.Message(role: .user, content: finalInput, toolCalls: [], toolCallID: nil, name: nil))
             
             var turnActive = true
             while turnActive {
