@@ -513,6 +513,32 @@ class AgentSession {
             if userInput.isEmpty { continue }
             if userInput == "/exit" || userInput == "/quit" { break }
             
+            if userInput.hasPrefix("!") {
+                let cmdStr = String(userInput.dropFirst()).trimmingCharacters(in: .whitespaces)
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/bash")
+                process.arguments = ["-c", cmdStr]
+                
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
+                
+                printColor("\n🟢 Shell: \(cmdStr)\n", color: "green")
+                try? process.run()
+                process.waitUntilExit()
+                
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                var outputStr = String(data: data, encoding: .utf8) ?? ""
+                if outputStr.isEmpty { outputStr = "(No output)" }
+                
+                let displayRes = outputStr.count > 2000 ? String(outputStr.prefix(2000)) + "... (truncated)" : outputStr
+                printColor("   \(displayRes)\n", color: "gray")
+                
+                let contextStr = "[User Executed Shell Command]: \(cmdStr)\n[Output]:\n\(displayRes)"
+                messages.append(GFTokenizer.Message(role: .user, content: contextStr, toolCalls: [], toolCallID: nil, name: nil))
+                continue
+            }
+            
             var finalInput = userInput
             if userInput.hasPrefix("/") {
                 let parts = userInput.split(separator: " ", maxSplits: 1)
