@@ -31,6 +31,11 @@ struct ReadlineWrapper {
                 let bind = unsafeBitCast(sym, to: RlBindFunc.self)
                 _ = bind("editing-mode", "emacs")
             }
+            typealias VoidFunc = @convention(c) () -> Void
+            if let sym = dlsym(handle, "using_history") {
+                let usingHistory = unsafeBitCast(sym, to: VoidFunc.self)
+                usingHistory()
+            }
             if let sym = dlsym(handle, "readline") {
                 readline = unsafeBitCast(sym, to: ReadlineFunc.self)
             }
@@ -481,7 +486,8 @@ class AgentSession {
     
     func startRepl() async throws {
         while true {
-            let prompt = "\n\u{01}\u{001B}[32m\u{02}Agent> \u{01}\u{001B}[0m\u{02}"
+            print("")
+            let prompt = "\u{01}\u{001B}[32m\u{02}Agent> \u{01}\u{001B}[0m\u{02}"
             guard let userInput = ReadlineWrapper.read(prompt: prompt) else { break }
             if userInput.isEmpty { continue }
             if userInput == "/exit" || userInput == "/quit" { break }
