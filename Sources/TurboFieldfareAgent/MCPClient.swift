@@ -28,17 +28,11 @@ class MCPClient: @unchecked Sendable {
         }
         
         // Init MCP
-        let initReq = """
-        {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"turbo-agent","version":"1.0.0"}}}
-        
-        """
+        let initReq = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"turbo-agent\",\"version\":\"1.0.0\"}}}\n"
         inPipe.fileHandleForWriting.write(initReq.data(using: .utf8)!)
         _ = readLine() // consume response
         
-        let initNotif = """
-        {"jsonrpc":"2.0","method":"notifications/initialized"}
-        
-        """
+        let initNotif = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
         inPipe.fileHandleForWriting.write(initNotif.data(using: .utf8)!)
     }
     
@@ -61,10 +55,7 @@ class MCPClient: @unchecked Sendable {
         let argsData = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
         let argsJson = String(data: argsData, encoding: .utf8) ?? "{}"
         
-        let req = """
-        {"jsonrpc":"2.0","id":\(reqId),"method":"tools/call","params":{"name":"\(name)","arguments":\(argsJson)}}
-        
-        """
+        let req = "{\"jsonrpc\":\"2.0\",\"id\":\(reqId),\"method\":\"tools/call\",\"params\":{\"name\":\"\(name)\",\"arguments\":\(argsJson)}}\n"
         inPipe.fileHandleForWriting.write(req.data(using: .utf8)!)
         
         // Read lines until we hit our response ID
