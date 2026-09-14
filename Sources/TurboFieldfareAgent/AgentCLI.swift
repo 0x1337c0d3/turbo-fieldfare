@@ -68,7 +68,7 @@ struct ReadlineWrapper {
         
         if let rl = readline {
             guard let cStr = rl(prompt) else { return nil }
-            signal(SIGINT, { _ in print("\n[Agent Interrupted]"); exit(130) })
+            signal(SIGINT, SIG_IGN)
             defer { free(cStr) }
             
             let str = String(cString: cStr)
@@ -414,6 +414,14 @@ class AgentRuntime {
         
         class StopFlag: @unchecked Sendable { var stop = false }
         let stopFlag = StopFlag()
+        let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+        sigintSource.setEventHandler {
+            print("\n[Generation Cancelled by User]")
+            stopFlag.stop = true
+        }
+        sigintSource.resume()
+        defer { sigintSource.cancel() }
+
         let sp = SpinnerState()
         
         let spinnerTask = Task {
