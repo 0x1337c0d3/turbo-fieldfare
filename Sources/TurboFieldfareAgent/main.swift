@@ -122,6 +122,22 @@ struct AgentConfig {
 struct ToolRegistry {
     static let definitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
+        GFTokenizer.FunctionDefinition(
+            name: "read_file",
+            description: "Reads the contents of a file",
+            parameters: .object([
+                "path": .object(["type": .string("string")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "write_file",
+            description: "Writes content to a file",
+            parameters: .object([
+                "path": .object(["type": .string("string")]),
+                "content": .object(["type": .string("string")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
             name: "execute_bash",
             description: "Executes a shell command natively",
             parameters: .object([
@@ -132,7 +148,29 @@ struct ToolRegistry {
     
     static func execute(call: ParsedToolCall) -> String {
         printColor("[Executing Tool: \(call.name)]\n", color: "yellow")
-        if call.name == "execute_bash" {
+        if call.name == "read_file" {
+            if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"] {
+                do {
+                    let content = try String(contentsOfFile: path, encoding: .utf8)
+                    return content
+                } catch {
+                    return "Error reading file: \(error)"
+                }
+            } else {
+                return "Error: invalid arguments"
+            }
+        } else if call.name == "write_file" {
+            if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"], case .string(let content) = argsMap["content"] {
+                do {
+                    try content.write(toFile: path, atomically: true, encoding: .utf8)
+                    return "Successfully wrote to \(path)"
+                } catch {
+                    return "Error writing file: \(error)"
+                }
+            } else {
+                return "Error: invalid arguments"
+            }
+        } else if call.name == "execute_bash" {
             if case .object(let argsMap) = call.arguments, case .string(let cmd) = argsMap["command"] {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/bin/bash")
