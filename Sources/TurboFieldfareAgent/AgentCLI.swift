@@ -122,6 +122,24 @@ struct AgentConfig {
 struct ToolRegistry {
     static let definitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
+            name: "code_nav_init",
+            description: "Initialize tree-sitter AST index",
+            parameters: .object(["reset": .object(["type": .string("string")])])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "code_symbols",
+            description: "List top-level symbols in a file or directory",
+            parameters: .object([
+                "path": .object(["type": .string("string")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "code_query",
+            description: "Query AST using S-expressions",
+            parameters: .object([
+                "query": .object(["type": .string("string")])
+            ])
+        ),
         GFTokenizer.FunctionDefinition(
             name: "read_file",
             description: "Reads the contents of a file",
@@ -147,7 +165,16 @@ struct ToolRegistry {
     ]
     
     static func execute(call: ParsedToolCall) -> String {
-        printColor("[Executing Tool: \(call.name)]\n", color: "yellow")
+        if call.name == "code_nav_init" || call.name == "code_symbols" || call.name == "code_query" {
+            guard let mcp = MCPClient.shared else { return "Error: MCP Client not initialized" }
+            var args: [String: Any] = [:]
+            if case .object(let map) = call.arguments {
+                for (k, v) in map {
+                    if case .string(let s) = v { args[k] = s }
+                }
+            }
+            return mcp.callTool(name: call.name, args: args)
+        }
         if call.name == "read_file" {
             if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"] {
                 do {
