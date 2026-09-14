@@ -19,10 +19,19 @@ func printColor(_ text: String, color: String) {
 
 typealias ReadlineFunc = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 typealias AddHistoryFunc = @convention(c) (UnsafePointer<CChar>?) -> Void
+typealias HistoryIOFunc = @convention(c) (UnsafePointer<CChar>?) -> Int32
 
 struct ReadlineWrapper {
     nonisolated(unsafe) static var readline: ReadlineFunc?
     nonisolated(unsafe) static var addHistory: AddHistoryFunc?
+    nonisolated(unsafe) static var writeHistory: HistoryIOFunc?
+    
+    static var historyFilePath: String? {
+        guard let home = ProcessInfo.processInfo.environment["HOME"] else { return nil }
+        let dir = home + "/.cache/TurboFieldfareAgent"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        return dir + "/history.txt"
+    }
     
     static func setup() {
         if let handle = dlopen("/usr/lib/libedit.dylib", RTLD_NOW) {
@@ -42,6 +51,15 @@ struct ReadlineWrapper {
             if let sym = dlsym(handle, "add_history") {
                 addHistory = unsafeBitCast(sym, to: AddHistoryFunc.self)
             }
+            if let sym = dlsym(handle, "read_history") {
+                let readHistory = unsafeBitCast(sym, to: HistoryIOFunc.self)
+                if let path = historyFilePath {
+                    _ = readHistory(path)
+                }
+            }
+            if let sym = dlsym(handle, "write_history") {
+                writeHistory = unsafeBitCast(sym, to: HistoryIOFunc.self)
+            }
         }
     }
     
@@ -49,13 +67,16 @@ struct ReadlineWrapper {
         if readline == nil { setup() }
         
         if let rl = readline {
-                        guard let cStr = rl(prompt) else { return nil }
+            guard let cStr = rl(prompt) else { return nil }
             signal(SIGINT, SIG_DFL)
             defer { free(cStr) }
             
             let str = String(cString: cStr)
             if !str.isEmpty {
                 addHistory?(cStr)
+                if let path = historyFilePath {
+                    _ = writeHistory?(path)
+                }
             }
             return str
         } else {
