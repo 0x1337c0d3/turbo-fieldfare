@@ -129,6 +129,13 @@ struct AgentConfig {
 struct ToolRegistry {
     static let definitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
+            name: "read_url",
+            description: "Fetches the content of a URL and converts the HTML into readable Markdown text.",
+            parameters: .object([
+                "url": .object(["type": .string("string")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
             name: "invoke_subagent",
             description: "Spawns a subagent to complete a complex sub-task. Use this to delegate long research or refactoring tasks.",
             parameters: .object([
@@ -203,6 +210,7 @@ struct ToolRegistry {
                                 else if let p = map["path"], case .string(let s) = p { argString = s }
                                 else if let q = map["query"], case .string(let s) = q { argString = s }
                                 else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
+                                else if let url = map["url"], case .string(let s) = url { argString = s }
                                 else { argString = map.keys.joined(separator: ", ") }
                                 if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
                             }
@@ -230,6 +238,45 @@ struct ToolRegistry {
                 }
             }
             return mcp.callTool(name: call.name, args: args)
+        }
+        if call.name == "read_url" {
+            if case .object(let argsMap) = call.arguments, case .string(let urlStr) = argsMap["url"], let url = URL(string: urlStr) {
+                do {
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                        return "Error: Bad HTTP response"
+                    }
+                    if let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) {
+                        var text = html
+                        text = text.replacingOccurrences(of: "(?is)<script.*?>.*?</script>", with: "", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?is)<style.*?>.*?</style>", with: "", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?is)<svg.*?>.*?</svg>", with: "", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)</p>", with: "\n\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)</div>", with: "\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)</h1>", with: "\n\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)</h2>", with: "\n\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)</li>", with: "\n", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)<li>", with: "- ", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "(?i)<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>", with: "[$2]($1)", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "&nbsp;", with: " ")
+                        text = text.replacingOccurrences(of: "&amp;", with: "&")
+                        text = text.replacingOccurrences(of: "&lt;", with: "<")
+                        text = text.replacingOccurrences(of: "&gt;", with: ">")
+                        text = text.replacingOccurrences(of: "&quot;", with: "\"")
+                        text = text.replacingOccurrences(of: "&#39;", with: "'")
+                        text = text.replacingOccurrences(of: " {2,}", with: " ", options: [.regularExpression])
+                        text = text.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: [.regularExpression])
+                        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    return "Error: Unable to decode text"
+                } catch {
+                    return "Error fetching URL: \(error)"
+                }
+            } else {
+                return "Error: invalid URL"
+            }
         }
         if call.name == "read_file" {
             if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"] {
@@ -477,6 +524,7 @@ class AgentSession {
                                 else if let p = map["path"], case .string(let s) = p { argString = s }
                                 else if let q = map["query"], case .string(let s) = q { argString = s }
                                 else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
+                                else if let url = map["url"], case .string(let s) = url { argString = s }
                                 else { argString = map.keys.joined(separator: ", ") }
                                 if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
                             }
