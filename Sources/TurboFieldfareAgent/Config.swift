@@ -7,7 +7,7 @@ struct AgentConfig {
 
     init() throws {
         var rawArgv = Array(CommandLine.arguments.dropFirst())
-        var systemPromptPath: String? = "docs/agent/codex_prompt.md"
+        var systemPromptPath: String?
         var agentsFilePath: String?
 
         var i = 0
@@ -40,21 +40,74 @@ struct AgentConfig {
             exit(2)
         }
 
-        var masterSystemPrompt = "You are a native Swift agent. You can execute tools natively.\n"
-        if let path = systemPromptPath {
+        var masterSystemPrompt = ""
+        
+        let fm = FileManager.default
+        let homeDir = fm.homeDirectoryForCurrentUser.path
+        let localDir = fm.currentDirectoryPath
+        
+        func appendFile(at path: String, header: String? = nil) {
             if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                masterSystemPrompt = content
-            } else {
-                printColor("Warning: Could not read system prompt at \(path)\n", color: "yellow")
+                if let header = header {
+                    if !masterSystemPrompt.isEmpty { masterSystemPrompt += "\n\n" }
+                    masterSystemPrompt += header + "\n"
+                } else if !masterSystemPrompt.isEmpty {
+                    masterSystemPrompt += "\n\n"
+                }
+                masterSystemPrompt += content
             }
         }
-        if let path = agentsFilePath {
-            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                masterSystemPrompt += "\n\n## Agent Guidelines\n\(content)"
-            } else {
-                printColor("Warning: Could not read agents file at \(path)\n", color: "yellow")
+        
+        func appendSkills(in directory: String) {
+            let skillsDir = (directory as NSString).appendingPathComponent("skills")
+            if let enumerator = fm.enumerator(atPath: skillsDir) {
+                let files = enumerator.allObjects as? [String] ?? []
+                for file in files.sorted() {
+                    if file.hasSuffix(".md") {
+                        let fullPath = (skillsDir as NSString).appendingPathComponent(file)
+                        appendFile(at: fullPath, header: "## Skill: \(file)")
+                    }
+                }
             }
         }
+        
+        // 1. ~/.agents/codex_prompt.md
+        let homeAgentsDir = (homeDir as NSString).appendingPathComponent(".agents")
+        appendFile(at: (homeAgentsDir as NSString).appendingPathComponent("codex_prompt.md"))
+        
+        // 2. ~/.agents/skills/**
+        appendSkills(in: homeAgentsDir)
+        
+        // 3. ./.agents/codex_prompt.md
+        let localAgentsDir = (localDir as NSString).appendingPathComponent(".agents")
+        appendFile(at: (localAgentsDir as NSString).appendingPathComponent("codex_prompt.md"))
+        
+        // 4. ./.agents/skills/**
+        appendSkills(in: localAgentsDir)
+        
+        // 5. ./AGENTS.md (or custom agents file from CLI)
+        if let customAgents = agentsFilePath {
+            appendFile(at: customAgents, header: "## Agent Guidelines")
+        } else {
+            appendFile(at: (localDir as NSString).appendingPathComponent("AGENTS.md"), header: "## Agent Guidelines")
+        }
+        
+        // Optionally append custom system prompt from CLI
+        if let customPrompt = systemPromptPath {
+            appendFile(at: customPrompt)
+        }
+
+        // Add MCP tool instructions (see 5)
+        if !masterSystemPrompt.isEmpty {
+            masterSystemPrompt += "\n\n"
+        }
+        masterSystemPrompt += "## MCP Tools\n"
+        masterSystemPrompt += "MCP tools are available and can be called natively."
+
+        if masterSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            masterSystemPrompt = "You are a native Swift agent. You can execute tools natively.\n"
+        }
+        
         self.systemPrompt = masterSystemPrompt
     }
 }

@@ -12,6 +12,67 @@ class AgentSession {
         ]
     }
 
+    private func handleShellCommand(userInput: String) {
+        let cmdStr = String(userInput.dropFirst()).trimmingCharacters(in: .whitespaces)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", cmdStr]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        printColor("\n● Shell: \(cmdStr)\n", color: "green")
+        try? process.run()
+        process.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var outputStr = String(data: data, encoding: .utf8) ?? ""
+        if outputStr.isEmpty { outputStr = "(No output)" }
+
+        let displayRes = outputStr.count > 2000 ? String(outputStr.prefix(2000)) + "... (truncated)" : outputStr
+        printColor("   \(displayRes)\n", color: "gray")
+
+        let contextStr = "[User Executed Shell Command]: \(cmdStr)\n[Output]:\n\(displayRes)"
+        messages.append(GFTokenizer.Message(role: .user, content: contextStr, toolCalls: [], toolCallID: nil, name: nil))
+    }
+
+    private func processSlashCommand(userInput: String) -> String? {
+        guard userInput.hasPrefix("/") else { return userInput }
+        
+        let parts = userInput.split(separator: " ", maxSplits: 1)
+        guard let command = parts.first else { return userInput }
+        
+        let cmdName = String(command.dropFirst())
+        let args = parts.count > 1 ? String(parts[1]) : ""
+
+        let fm = FileManager.default
+        let homeDir = fm.homeDirectoryForCurrentUser.path
+        let localDir = fm.currentDirectoryPath
+        
+        let homeSkillPath = (homeDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
+        let localSkillPath = (localDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
+        
+        var loadedSkillContent: String?
+        var loadedSkillPath: String?
+        
+        if let content = try? String(contentsOfFile: homeSkillPath, encoding: .utf8) {
+            loadedSkillContent = content
+            loadedSkillPath = homeSkillPath
+        } else if let content = try? String(contentsOfFile: localSkillPath, encoding: .utf8) {
+            loadedSkillContent = content
+            loadedSkillPath = localSkillPath
+        }
+        
+        if let skillContent = loadedSkillContent, let skillPath = loadedSkillPath {
+            printColor("[Loaded skill /\(cmdName) from \(skillPath)]\n", color: "blue")
+            return "[Skill: \(cmdName)]\n\(skillContent)\n\nUser Request:\n\(args)"
+        } else {
+            printColor("Warning: Skill '/\(cmdName)' not found in ~/.agents/skills/ or ./.agents/skills/\n", color: "yellow")
+            return nil
+        }
+    }
+
     func startRepl() async throws {
         while true {
             print("")
@@ -22,49 +83,22 @@ class AgentSession {
             
             if userInput.isEmpty { continue }
             if userInput == "/exit" || userInput == "/quit" { break }
+            if userInput == "/prompt" {
+                printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
+                continue
+            }
 
             if userInput.hasPrefix("!") {
-                let cmdStr = String(userInput.dropFirst()).trimmingCharacters(in: .whitespaces)
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/bin/bash")
-                process.arguments = ["-c", cmdStr]
-
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                printColor("\n● Shell: \(cmdStr)\n", color: "green")
-                try? process.run()
-                process.waitUntilExit()
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                var outputStr = String(data: data, encoding: .utf8) ?? ""
-                if outputStr.isEmpty { outputStr = "(No output)" }
-
-                let displayRes = outputStr.count > 2000 ? String(outputStr.prefix(2000)) + "... (truncated)" : outputStr
-                printColor("   \(displayRes)\n", color: "gray")
-
-                let contextStr = "[User Executed Shell Command]: \(cmdStr)\n[Output]:\n\(displayRes)"
-                messages.append(GFTokenizer.Message(role: .user, content: contextStr, toolCalls: [], toolCallID: nil, name: nil))
+                handleShellCommand(userInput: userInput)
                 continue
             }
 
             var finalInput = userInput
             if userInput.hasPrefix("/") {
-                let parts = userInput.split(separator: " ", maxSplits: 1)
-                if let command = parts.first {
-                    let cmdName = String(command.dropFirst())
-                    let args = parts.count > 1 ? String(parts[1]) : ""
-
-                    let skillPath = "docs/agent/skills/\(cmdName).md"
-                    if let skillContent = try? String(contentsOfFile: skillPath, encoding: .utf8) {
-                        printColor("[Loaded skill /\(cmdName) from \(skillPath)]\n", color: "blue")
-                        finalInput = "[Skill: \(cmdName)]\n\(skillContent)\n\nUser Request:\n\(args)"
-                    } else {
-                        printColor("Warning: Skill '/\(cmdName)' not found at \(skillPath)\n", color: "yellow")
-                        continue
-                    }
+                guard let processedInput = processSlashCommand(userInput: userInput) else {
+                    continue
                 }
+                finalInput = processedInput
             }
 
             messages.append(GFTokenizer.Message(role: .user, content: finalInput, toolCalls: [], toolCallID: nil, name: nil))
