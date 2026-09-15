@@ -49,10 +49,33 @@ class AgentSession {
         let fm = FileManager.default
         let homeDir = fm.homeDirectoryForCurrentUser.path
         let localDir = fm.currentDirectoryPath
-        
+
+        if cmdName.isEmpty || cmdName == "skills" {
+            var availableSkills = Set<String>()
+            let homeSkillsDir = (homeDir as NSString).appendingPathComponent(".agents/skills")
+            let localSkillsDir = (localDir as NSString).appendingPathComponent(".agents/skills")
+            
+            for dir in [homeSkillsDir, localSkillsDir] {
+                if let files = try? fm.contentsOfDirectory(atPath: dir) {
+                    for file in files where file.hasSuffix(".md") {
+                        availableSkills.insert(String(file.dropLast(3)))
+                    }
+                }
+            }
+            
+            printColor("\n[Available Skills]:\n", color: "blue")
+            if availableSkills.isEmpty {
+                printColor("  (No skills found in ~/.agents/skills/ or ./.agents/skills/)\n", color: "gray")
+            } else {
+                for skill in availableSkills.sorted() {
+                    printColor("  /\(skill)\n", color: "green")
+                }
+            }
+            return nil
+        }
+
         let homeSkillPath = (homeDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
         let localSkillPath = (localDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
-        
         var loadedSkillContent: String?
         var loadedSkillPath: String?
         
