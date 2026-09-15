@@ -2,7 +2,9 @@ import Foundation
 import TurboFieldfare
 
 struct ToolRegistry {
-    static let definitions: [GFTokenizer.FunctionDefinition] = [
+    nonisolated(unsafe) static var definitions: [GFTokenizer.FunctionDefinition] = baseDefinitions
+    nonisolated(unsafe) static var mcpTools: Set<String> = []
+    static let baseDefinitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
             name: "read_url",
             description: "Fetches the content of a URL and converts the HTML into readable Markdown text.",
@@ -106,12 +108,22 @@ struct ToolRegistry {
         )
     ]
 
+        static func reloadMCPTools() async {
+        var newDefs = baseDefinitions
+        var newMcpTools = Set<String>()
+        if let client = MCPClient.shared {
+            let tools = await client.listAllTools()
+            newDefs.append(contentsOf: tools)
+            newMcpTools = Set(tools.map { $0.name })
+        }
+        definitions = newDefs
+        mcpTools = newMcpTools
+    }
+
     static func execute(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
         switch call.name {
         case "invoke_subagent":
             return await executeInvokeSubagent(call: call, runtime: runtime)
-        case "code_nav_init", "code_symbols", "code_query":
-            return executeMCP(call: call)
         case "read_url":
             return await executeReadURL(call: call)
         case "read_file":
@@ -171,7 +183,7 @@ struct ToolRegistry {
         return subSession.messages.last?.content ?? "No output from subagent."
     }
 
-    private static func executeMCP(call: ParsedToolCall) -> String {
+    private static func executeMCP(call: ParsedToolCall) async -> String {
         guard let mcp = MCPClient.shared else { return "Error: MCP Client not initialized" }
         var args: [String: Any] = [:]
         if case .object(let map) = call.arguments {
@@ -179,7 +191,9 @@ struct ToolRegistry {
                 if case .string(let s) = v { args[k] = s }
             }
         }
-        return mcp.callTool(name: call.name, args: args)
+        let argsData = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        let argsJson = String(data: argsData, encoding: .utf8) ?? "{}"
+        return await mcp.callTool(name: call.name, argsJson: argsJson)
     }
 
     private static func executeReadURL(call: ParsedToolCall) async -> String {

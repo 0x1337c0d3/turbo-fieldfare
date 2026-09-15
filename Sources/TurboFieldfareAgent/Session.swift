@@ -110,13 +110,22 @@ class AgentSession {
                 printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
                 continue
             }
+            if userInput == "/mcp reload" {
+                MCPClient.shared = MCPClient()
+                await ToolRegistry.reloadMCPTools()
+                if MCPClient.shared != nil {
+                    printColor("\n[MCP Client]: Reloaded successfully.\n", color: "green")
+                } else {
+                    printColor("\n[MCP Client]: Failed to reload configuration.\n", color: "red")
+                }
+                continue
+            }
             if userInput == "/mcp" {
                 if let client = MCPClient.shared {
                     printColor("\n[MCP Servers]:\n", color: "blue")
                     for server in client.servers {
-                        let path = server.process.executableURL?.path ?? "unknown"
-                        let args = server.process.arguments?.joined(separator: " ") ?? ""
-                        printColor("  - \(server.name) (\(path) \(args))\n", color: "green")
+                        
+                        printColor("  - \(server.name) (\(server.connectionDetails))\n", color: "green")
                     }
                     if client.servers.isEmpty {
                         printColor("  (No MCP servers configured or running)\n", color: "gray")
