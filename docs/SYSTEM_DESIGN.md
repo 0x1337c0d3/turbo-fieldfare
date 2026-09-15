@@ -448,7 +448,8 @@ covers the Mac app at 8K and CLI stress at 64K. Audio input, video input,
 training, fine-tuning, server batching, remote serving, and general model
 support are outside the current scope. The optional HTTP server is loopback-only, owns one
 warm model, serializes generation, and retains one verified conversational KV
-prefix by default. It retains only that prefix. See the
+lineage by default. It supports Longest Common Prefix (LCP) caching and
+O(1) memory-level context rewinding for seamless retrieved-code hot swapping. See the
 [local server guide](OPENAI_SERVER.md).
 
 TurboFieldfare is a research system. The Mac app exposes a small set of typed

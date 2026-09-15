@@ -919,6 +919,9 @@ public actor ServerModelSession: ServerInferenceBackend {
         switch cacheMatch {
         case .hit(let effective, let cached):
             effectivePromptIDs = effective
+            if cached < (promptCache.kvBackedTokenIDs?.count ?? 0) {
+                try runner.rewind(to: cached)
+            }
             completionStart = .resume(cachedPromptTokens: cached)
             multimodalInput = nil
         case .renderThenResume(let cached):

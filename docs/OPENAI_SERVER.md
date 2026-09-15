@@ -172,15 +172,17 @@ request.
 
 ## Prompt reuse
 
-Single-prefix KV reuse is on by default. Send the complete message history with
-every request. When a request continues the retained conversation exactly, the
-server reuses the verified KV prefix and reports the number of reused tokens in:
+KV cache reuse is on by default and uses **Longest Common Prefix (LCP)** matching. Send the complete message history with
+every request. When a request shares a common prefix with the retained conversation (for example, pinned system rules, tool schemas, or previous chat history), the
+server natively rewinds its KV cache to the point of divergence and reuses the common prefix. It reports the number of reused tokens in:
 
 ```text
 usage.prompt_tokens_details.cached_tokens
 ```
 
-The server retains one prefix. A different or incompatible history replaces
+This enables **Memory-Level Context Manipulation** without tokenizing the entire prompt again. For example, if you replace a mid-context retrieved code buffer, the server simply discards the trailing divergent memory in O(1) time and resumes prefilling the new code onto the end of the pinned system rules.
+
+The server retains one active KV lineage. A completely disjoint history replaces
 it. Use `--prompt-cache-mode off` to disable reuse.
 
 ## Tool calls

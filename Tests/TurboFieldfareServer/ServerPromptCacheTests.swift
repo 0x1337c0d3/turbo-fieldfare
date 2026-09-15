@@ -291,13 +291,19 @@ struct ServerPromptCacheTests {
         let rendered = tokenizer.encode(
             try tokenizer.applyChatTemplate(changed.messages),
             addBOS: false)
-        // A changed first message is a diverged history, and the miss now says
-        // so rather than arriving as an anonymous one.
-        #expect(cache.match(
+        // A changed first message is a diverged history, but it still shares
+        // the initial `<bos><start_of_turn>user\n` prefix with the cache.
+        // We expect it to salvage that common prefix.
+        let match = cache.match(
             domain: domain,
             request: changed,
             renderedPromptIDs: rendered,
-            tokenizer: tokenizer).missReason == .historyDiverged)
+            tokenizer: tokenizer)
+        if case .hit(_, let cached) = match {
+            #expect(cached > 0)
+        } else {
+            Issue.record("Expected partial prefix hit, got \(match)")
+        }
     }
 
     @Test func tailCompletedStopStringDoesNotPublishPrefix() async throws {

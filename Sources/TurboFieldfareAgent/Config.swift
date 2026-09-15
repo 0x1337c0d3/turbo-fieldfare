@@ -1,7 +1,6 @@
-import TurboFieldfareCLICore
 import Foundation
+import TurboFieldfareCLICore
 
-// MARK: - AgentConfig
 struct AgentConfig {
     let args: Args
     let systemPrompt: String

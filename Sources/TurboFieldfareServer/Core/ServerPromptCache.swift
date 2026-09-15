@@ -145,6 +145,42 @@ struct ServerPromptCache: Sendable {
         renderedPromptIDs: [Int32]?,
         tokenizer: GFTokenizer
     ) -> ServerPromptCacheMatch {
+        let exactMatch = matchExact(
+            domain: domain,
+            request: request,
+            renderedPromptIDs: renderedPromptIDs,
+            tokenizer: tokenizer
+        )
+        if case .miss = exactMatch,
+           let renderedPromptIDs,
+           let requestIdentities = Self.identities(for: request),
+           requestIdentities.allSatisfy(\.isEmpty),
+           entry?.inputImageIdentities.allSatisfy(\.isEmpty) == true,
+           let entry = entry {
+            
+            var commonPrefixLength = 0
+            for (i, j) in zip(renderedPromptIDs, entry.kvBackedTokenIDs) {
+                if i == j {
+                    commonPrefixLength += 1
+                } else {
+                    break
+                }
+            }
+            if commonPrefixLength > 0 {
+                return .hit(
+                    effectivePromptIDs: renderedPromptIDs,
+                    cachedPromptTokens: commonPrefixLength)
+            }
+        }
+        return exactMatch
+    }
+
+    private func matchExact(
+        domain: ServerPromptCacheDomain,
+        request: ValidatedChatRequest,
+        renderedPromptIDs: [Int32]?,
+        tokenizer: GFTokenizer
+    ) -> ServerPromptCacheMatch {
         guard let entry,
               entry.domain == domain,
               entry.tools == request.tools,
