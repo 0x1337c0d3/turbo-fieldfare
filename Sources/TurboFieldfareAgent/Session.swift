@@ -110,6 +110,22 @@ class AgentSession {
                 printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
                 continue
             }
+            if userInput == "/mcp" {
+                if let client = MCPClient.shared {
+                    printColor("\n[MCP Servers]:\n", color: "blue")
+                    for server in client.servers {
+                        let path = server.process.executableURL?.path ?? "unknown"
+                        let args = server.process.arguments?.joined(separator: " ") ?? ""
+                        printColor("  - \(server.name) (\(path) \(args))\n", color: "green")
+                    }
+                    if client.servers.isEmpty {
+                        printColor("  (No MCP servers configured or running)\n", color: "gray")
+                    }
+                } else {
+                    printColor("\n[MCP Client]: Not initialized or no configuration found.\n", color: "yellow")
+                }
+                continue
+            }
 
             if userInput.hasPrefix("!") {
                 handleShellCommand(userInput: userInput)
