@@ -154,7 +154,10 @@ final class AgentSession {
         }
         printColor("\nType ? and press Enter for commands, skills, and built-in tools.\n", color: "gray")
         while let input = readInput() {
-            if input == "/exit" || input == "/quit" { break }
+            if input == "/exit" || input == "/quit" { 
+                await runConsolidation()
+                break 
+            }
             if await handleCommand(input) { continue }
             guard let request = processSlashCommand(userInput: input) else { continue }
             let prompt: String
@@ -226,7 +229,10 @@ final class AgentSession {
             await reloadMCP()
         case "/mcp":
             printMCPServers()
+        case "/consolidate":
+            await runConsolidation()
         case "/clear", "/new":
+            await runConsolidation()
             messages = [messages[0]]
             printColor("\n[Context cleared. Starting fresh.]\n", color: "green")
         case _ where input.hasPrefix("!"):
@@ -234,6 +240,21 @@ final class AgentSession {
         default: return false
         }
         return true
+    }
+
+    private func runConsolidation() async {
+        let memoryService = self.memoryService
+        printColor("\n[Running memory consolidation...]\n", color: "blue")
+        do {
+            let result = try await ConsolidationAgent.run(
+                runtime: runtime, 
+                memoryService: memoryService, 
+                conversationHistory: messages
+            )
+            printColor("\n[Consolidation Complete]:\n\(result)\n", color: "green")
+        } catch {
+            printColor("\n[Consolidation Failed]: \(error)\n", color: "yellow")
+        }
     }
 
     private func compactHistory() async {
