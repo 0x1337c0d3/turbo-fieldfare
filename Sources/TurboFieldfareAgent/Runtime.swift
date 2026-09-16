@@ -77,13 +77,21 @@ final class AgentRuntime: @unchecked Sendable {
         
         if target == .cloud, let client = openAIClient {
             if interaction == nil { terminalPrint("\n\u{001B}[33m[Auto-Routed to Cloud (OpenAI)]\u{001B}[0m\n") }
+            
+            let cancellation = interaction?.cancellation ?? AgentCancellation()
+            let terminal = (interaction == nil) ? TerminalGeneration(cancellation: cancellation) : nil
+            
             do {
                 let result = try await client.generate(messages: messages, tools: definitions)
-                if interaction == nil { terminalPrint(result.content) }
-                else { interaction?.text(result.content) }
+                
+                if let interaction { interaction.text(result.content) }
+                else { terminal?.text(result.content) }
+                
+                await terminal?.finish()
                 lastStopReason = .endOfTurn
                 return result
             } catch {
+                await terminal?.finish()
                 if interaction == nil { terminalPrint("\n\u{001B}[31m[Cloud route failed: \(error). Falling back to Local...]\u{001B}[0m\n") }
                 return try await generateLocally(messages: messages, tools: definitions, interaction: interaction)
             }
