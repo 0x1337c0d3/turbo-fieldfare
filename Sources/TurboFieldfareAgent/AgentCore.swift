@@ -1,22 +1,18 @@
 import Foundation
 import TurboFieldfare
 
-final class ScratchpadStore: @unchecked Sendable {
-    var notes: String = "Scratchpad is empty."
-}
-
 struct AgentToolContext: Sendable {
     let directory: URL
     let systemPrompt: String
     let mcp: MCPClient?
     let definitions: [GFTokenizer.FunctionDefinition]
     let interaction: AgentInteraction?
-    let scratchpadStore: ScratchpadStore?
+    let memoryService: MemoryService?
 
-    static func terminal(_ runtime: AgentRuntime, scratchpadStore: ScratchpadStore? = nil) -> Self {
+    static func terminal(_ runtime: AgentRuntime, memoryService: MemoryService? = nil) -> Self {
         Self(directory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
              systemPrompt: runtime.config.systemPrompt, mcp: MCPClient.shared,
-             definitions: ToolRegistry.definitions, interaction: nil, scratchpadStore: scratchpadStore)
+             definitions: ToolRegistry.definitions, interaction: nil, memoryService: memoryService)
     }
 
     func path(_ path: String) -> String {
@@ -29,10 +25,22 @@ struct AgentToolContext: Sendable {
 enum AgentTurn {
     static func run(runtime: AgentRuntime, messages: inout [GFTokenizer.Message],
                     context: AgentToolContext, resultLimit: Int = 300) async throws -> String {
+        let memoryBootstrap: String
+        if let memoryService = context.memoryService {
+            if let session = await memoryService.beginSession(id: "agent_turn", workspaceOverride: context.directory.path, modelID: nil, tag: nil, focus: nil) {
+                let instructions = await memoryService.instructions(for: session)
+                memoryBootstrap = "\n\n" + instructions
+            } else {
+                memoryBootstrap = ""
+            }
+        } else {
+            memoryBootstrap = ""
+        }
+        
         let result = try await ConversationTurn.run(messages: &messages, generate: { messages in
             var msgs = messages
-            if let store = context.scratchpadStore, msgs.count > 1 {
-                msgs[1] = GFTokenizer.Message(role: .system, content: "Current Scratchpad:\n\(store.notes)", toolCalls: [], toolCallID: nil, name: nil)
+            if msgs.count > 1, !memoryBootstrap.isEmpty {
+                msgs[0] = GFTokenizer.Message(role: .system, content: context.systemPrompt + memoryBootstrap, toolCalls: [], toolCallID: nil, name: nil)
             }
             try context.interaction?.cancellation.check()
             return try await runtime.generate(messages: msgs, tools: context.definitions,
@@ -56,8 +64,8 @@ enum AgentTurn {
             }
             return result
         })
-        if let store = context.scratchpadStore, messages.count > 1 {
-            messages[1] = GFTokenizer.Message(role: .system, content: "Current Scratchpad:\n\(store.notes)", toolCalls: [], toolCallID: nil, name: nil)
+        if messages.count > 1, !memoryBootstrap.isEmpty {
+            messages[0] = GFTokenizer.Message(role: .system, content: context.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
         }
         return result
     }
@@ -76,7 +84,8 @@ actor AgentCore: ACPBackend {
         let directory: URL
         let skills: [String: URL]
         let serverConfigs: [String: AgentMCPConfig.ServerConfig]
-        let scratchpadStore = ScratchpadStore()
+        
+        let memoryService: MemoryService?
         var mcp: MCPClient?
         var definitions: [GFTokenizer.FunctionDefinition]?
         var messages: [GFTokenizer.Message]
@@ -98,10 +107,11 @@ actor AgentCore: ACPBackend {
         var configured = MCPClient.localConfigurations()
         // Editor-supplied servers replace native entries with the same name.
         configured.merge(servers) { _, supplied in supplied }
-        sessions[id] = Session(config: config, directory: directory, skills: skills,
-                               serverConfigs: configured, messages: [
-            .init(role: .system, content: config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil),
-            .init(role: .system, content: "Scratchpad is empty.", toolCalls: [], toolCallID: nil, name: nil)
+        let memoryConfig = MemoryConfiguration.fromEnvironment( ProcessInfo.processInfo.environment)
+        let memoryService = MemoryService(configuration: memoryConfig, log: { _ in })
+        Task { await memoryService.warmUp() }
+        sessions[id] = Session(config: config, directory: directory, skills: skills, serverConfigs: configured, memoryService: memoryService, messages: [
+            .init(role: .system, content: config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
         ])
         return skills.keys.sorted()
     }
@@ -122,7 +132,8 @@ actor AgentCore: ACPBackend {
             let tools = ToolRegistry.adaptedMCPTools(await mcp.listAllTools())
             try interaction.cancellation.check()
             session.mcp = mcp
-            session.definitions = ToolRegistry.baseDefinitions + tools
+            let memDefs = await ToolRegistry.memoryDefinitions(service: session.memoryService)
+            session.definitions = ToolRegistry.baseDefinitions + tools + memDefs
         }
         if runtime == nil { runtime = try await AgentRuntime(config: session.config) }
         guard let runtime else { throw ACPError(code: -32603, message: "Runtime unavailable") }
@@ -132,7 +143,7 @@ actor AgentCore: ACPBackend {
         runtime.remainingToolCalls = 64
         let context = AgentToolContext(directory: session.directory, systemPrompt: session.config.systemPrompt,
                                        mcp: session.mcp, definitions: session.definitions ?? [], interaction: interaction,
-                                       scratchpadStore: session.scratchpadStore)
+                                       memoryService: session.memoryService)
 
         let maxMessages = 30
         if session.messages.count > maxMessages {

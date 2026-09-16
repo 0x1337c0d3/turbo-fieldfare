@@ -5,14 +5,18 @@ import TurboFieldfare
 final class AgentSession {
     let runtime: AgentRuntime
     var messages: [GFTokenizer.Message]
-    let scratchpadStore = ScratchpadStore()
+    let memoryService: MemoryService
 
     init(runtime: AgentRuntime) {
         self.runtime = runtime
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let memoryConfig = MemoryConfiguration.fromEnvironment(ProcessInfo.processInfo.environment)
+        self.memoryService = MemoryService(configuration: memoryConfig, log: { _ in })
         self.messages = [
-            GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil),
-            GFTokenizer.Message(role: .system, content: "Scratchpad is empty.", toolCalls: [], toolCallID: nil, name: nil)
+            GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
         ]
+        let service = self.memoryService
+        Task { [service] in await service.warmUp() }
     }
 
     private func handleShellCommand(userInput: String) {
@@ -189,8 +193,7 @@ final class AgentSession {
             let rolling = Array(messages.suffix(from: safeIdx))
             messages = pinned + rolling
         }
-
-        let context = AgentToolContext.terminal(runtime, scratchpadStore: scratchpadStore)
+        let context = AgentToolContext.terminal(runtime, memoryService: memoryService)
         return try await AgentTurn.run(runtime: runtime, messages: &messages,
                                        context: context, resultLimit: resultLimit)
     }

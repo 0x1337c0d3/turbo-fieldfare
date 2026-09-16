@@ -28,6 +28,10 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "ContinuityCore",
+            path: "Sources/ContinuityCore"
+        ),
+        .target(
             name: "TurboFieldfareFormat",
             path: "Sources/TurboFieldfareFormat"
         ),
@@ -126,6 +130,7 @@ let package = Package(
             name: "TurboFieldfareAgent",
             dependencies: [
                 "AgentLineEditor",
+                "ContinuityCore",
                 "TurboFieldfare",
                 "TurboFieldfareCLICore",
                 "TurboFieldfareServerCore",

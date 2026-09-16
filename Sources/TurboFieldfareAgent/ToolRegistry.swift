@@ -7,17 +7,6 @@ struct ToolRegistry {
     nonisolated(unsafe) static var mcpTools: Set<String> = []
     static let baseDefinitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
-            name: "update_scratchpad",
-            description: "Updates the agent's scratchpad with notes, plans, and learnings. This memory is permanent and helps you remember your overarching goals and what you have tried across long debugging sessions.",
-            parameters: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "notes": .object(["type": .string("string")])
-                ]),
-                "required": .array([.string("notes")])
-            ])
-        ),
-        GFTokenizer.FunctionDefinition(
             name: "read_url",
             description: "Fetches the content of a URL and converts the HTML into readable Markdown text.",
             parameters: .object([
@@ -88,6 +77,30 @@ struct ToolRegistry {
         )
     ]
 
+    static func memoryDefinitions(service: MemoryService?) async -> [GFTokenizer.FunctionDefinition] {
+        guard let service = service else { return [] }
+        return await service.toolDefinitions().map { def in
+            GFTokenizer.FunctionDefinition(
+                name: def.name,
+                description: def.description,
+                parameters: try! mapMemorySchema(def.parameters)
+            )
+        }
+    }
+
+    private static func mapMemorySchema(_ schema: MemoryToolSchema) throws -> JSONValue {
+        switch schema {
+        case .string: return .object(["type": .string("string")])
+        case .integer: return .object(["type": .string("integer")])
+        case .number: return .object(["type": .string("number")])
+        case .stringArray: return .object(["type": .string("array"), "items": .object(["type": .string("string")])])
+        case .object(let properties, let required):
+            var mappedProps: [String: JSONValue] = [:]
+            for (key, val) in properties { mappedProps[key] = try mapMemorySchema(val) }
+            return .object(["type": .string("object"), "properties": .object(mappedProps), "required": .array(required.map { .string($0) })])
+        }
+    }
+
     static func adaptedMCPTools(
         _ tools: [GFTokenizer.FunctionDefinition],
         reportError: (String) -> Void = { printColor($0 + "\n", color: "yellow") }
@@ -109,7 +122,7 @@ struct ToolRegistry {
         }
     }
 
-    static func reloadMCPTools() async {
+    static func reloadMCPTools(memoryService: MemoryService? = nil) async {
         var newDefs = baseDefinitions
         var newMcpTools = Set<String>()
         if let client = MCPClient.shared {
@@ -117,6 +130,7 @@ struct ToolRegistry {
             newDefs.append(contentsOf: tools)
             newMcpTools = Set(tools.map { $0.name })
         }
+        newDefs.append(contentsOf: await memoryDefinitions(service: memoryService))
         definitions = newDefs
         mcpTools = newMcpTools
     }
@@ -155,14 +169,21 @@ struct ToolRegistry {
             return await executeEditFile(call: call, context: context)
         case "execute_bash":
             return await executeBash(call: call, context: context)
-        case "update_scratchpad":
-            guard let notes = call.stringArgument("notes") else { return "Error: invalid arguments" }
-            if let store = context.scratchpadStore {
-                store.notes = notes
-                return "Scratchpad updated successfully."
-            }
-            return "Error: Scratchpad updates are not supported in this context."
         default:
+            if let memoryService = context.memoryService,
+               await memoryService.toolDefinitions().contains(where: { $0.name == call.name }) {
+                let session = await memoryService.beginSession(id: "agent_turn", workspaceOverride: context.directory.path, modelID: nil, tag: nil, focus: nil)
+                guard let session = session else { return "Error: memory session rejected" }
+                do {
+                    let data = call.argumentsJSON.data(using: .utf8)!
+                    let dict = try JSONDecoder().decode([String: MemoryToolValue].self, from: data)
+                    let result = await memoryService.execute(name: call.name, arguments: dict, in: session)
+                    return result.jsonString()
+                    
+                } catch {
+                    return "Error parsing memory tool args: \(error)"
+                }
+            }
             if isMCPTool(call.name, definitions: context.definitions) {
                 return await executeMCP(call: call, mcp: context.mcp)
             }
