@@ -5,11 +5,13 @@ import TurboFieldfare
 final class AgentSession {
     let runtime: AgentRuntime
     var messages: [GFTokenizer.Message]
+    let scratchpadStore = ScratchpadStore()
 
     init(runtime: AgentRuntime) {
         self.runtime = runtime
         self.messages = [
-            GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
+            GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil),
+            GFTokenizer.Message(role: .system, content: "Scratchpad is empty.", toolCalls: [], toolCallID: nil, name: nil)
         ]
     }
 
@@ -163,8 +165,24 @@ final class AgentSession {
     }
 
     func completeTurn(resultLimit: Int = 300) async throws -> String {
-        try await AgentTurn.run(runtime: runtime, messages: &messages,
-                                context: .terminal(runtime), resultLimit: resultLimit)
+        let maxMessages = 30
+        if messages.count > maxMessages {
+            let keepCount = 20
+            let startIdx = messages.count - keepCount
+            var safeIdx = startIdx
+            while safeIdx < messages.count {
+                if messages[safeIdx].role == .user { break }
+                safeIdx += 1
+            }
+            if safeIdx == messages.count { safeIdx = startIdx }
+            let pinned = Array(messages.prefix(2))
+            let rolling = Array(messages.suffix(from: safeIdx))
+            messages = pinned + rolling
+        }
+
+        let context = AgentToolContext.terminal(runtime, scratchpadStore: scratchpadStore)
+        return try await AgentTurn.run(runtime: runtime, messages: &messages,
+                                       context: context, resultLimit: resultLimit)
     }
 
     private func readInput() -> String? {

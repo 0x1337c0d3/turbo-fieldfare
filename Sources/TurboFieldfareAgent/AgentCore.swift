@@ -1,17 +1,22 @@
 import Foundation
 import TurboFieldfare
 
+final class ScratchpadStore: @unchecked Sendable {
+    var notes: String = "Scratchpad is empty."
+}
+
 struct AgentToolContext: Sendable {
     let directory: URL
     let systemPrompt: String
     let mcp: MCPClient?
     let definitions: [GFTokenizer.FunctionDefinition]
     let interaction: AgentInteraction?
+    let scratchpadStore: ScratchpadStore?
 
-    static func terminal(_ runtime: AgentRuntime) -> Self {
+    static func terminal(_ runtime: AgentRuntime, scratchpadStore: ScratchpadStore? = nil) -> Self {
         Self(directory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
              systemPrompt: runtime.config.systemPrompt, mcp: MCPClient.shared,
-             definitions: ToolRegistry.definitions, interaction: nil)
+             definitions: ToolRegistry.definitions, interaction: nil, scratchpadStore: scratchpadStore)
     }
 
     func path(_ path: String) -> String {
@@ -24,9 +29,13 @@ struct AgentToolContext: Sendable {
 enum AgentTurn {
     static func run(runtime: AgentRuntime, messages: inout [GFTokenizer.Message],
                     context: AgentToolContext, resultLimit: Int = 300) async throws -> String {
-        try await ConversationTurn.run(messages: &messages, generate: { messages in
+        let result = try await ConversationTurn.run(messages: &messages, generate: { messages in
+            var msgs = messages
+            if let store = context.scratchpadStore, msgs.count > 1 {
+                msgs[1] = GFTokenizer.Message(role: .system, content: "Current Scratchpad:\n\(store.notes)", toolCalls: [], toolCallID: nil, name: nil)
+            }
             try context.interaction?.cancellation.check()
-            return try await runtime.generate(messages: messages, tools: context.definitions,
+            return try await runtime.generate(messages: msgs, tools: context.definitions,
                                               interaction: context.interaction)
         }, execute: { parsedCall in
             // Tool IDs in UI events are unique across generations and subagents.
@@ -47,6 +56,10 @@ enum AgentTurn {
             }
             return result
         })
+        if let store = context.scratchpadStore, messages.count > 1 {
+            messages[1] = GFTokenizer.Message(role: .system, content: "Current Scratchpad:\n\(store.notes)", toolCalls: [], toolCallID: nil, name: nil)
+        }
+        return result
     }
 }
 
@@ -63,6 +76,7 @@ actor AgentCore: ACPBackend {
         let directory: URL
         let skills: [String: URL]
         let serverConfigs: [String: AgentMCPConfig.ServerConfig]
+        let scratchpadStore = ScratchpadStore()
         var mcp: MCPClient?
         var definitions: [GFTokenizer.FunctionDefinition]?
         var messages: [GFTokenizer.Message]
@@ -86,7 +100,8 @@ actor AgentCore: ACPBackend {
         configured.merge(servers) { _, supplied in supplied }
         sessions[id] = Session(config: config, directory: directory, skills: skills,
                                serverConfigs: configured, messages: [
-            .init(role: .system, content: config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
+            .init(role: .system, content: config.systemPrompt, toolCalls: [], toolCallID: nil, name: nil),
+            .init(role: .system, content: "Scratchpad is empty.", toolCalls: [], toolCallID: nil, name: nil)
         ])
         return skills.keys.sorted()
     }
@@ -116,7 +131,24 @@ actor AgentCore: ACPBackend {
         cacheSession = id
         runtime.remainingToolCalls = 64
         let context = AgentToolContext(directory: session.directory, systemPrompt: session.config.systemPrompt,
-                                       mcp: session.mcp, definitions: session.definitions ?? [], interaction: interaction)
+                                       mcp: session.mcp, definitions: session.definitions ?? [], interaction: interaction,
+                                       scratchpadStore: session.scratchpadStore)
+
+        let maxMessages = 30
+        if session.messages.count > maxMessages {
+            let keepCount = 20
+            let startIdx = session.messages.count - keepCount
+            var safeIdx = startIdx
+            while safeIdx < session.messages.count {
+                if session.messages[safeIdx].role == .user { break }
+                safeIdx += 1
+            }
+            if safeIdx == session.messages.count { safeIdx = startIdx }
+            let pinned = Array(session.messages.prefix(2))
+            let rolling = Array(session.messages.suffix(from: safeIdx))
+            session.messages = pinned + rolling
+        }
+
         let previousCount = session.messages.count
         session.messages.append(.init(role: .user, content: prompt, toolCalls: [], toolCallID: nil, name: nil))
         do {

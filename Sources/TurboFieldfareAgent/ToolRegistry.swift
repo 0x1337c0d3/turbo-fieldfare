@@ -7,6 +7,17 @@ struct ToolRegistry {
     nonisolated(unsafe) static var mcpTools: Set<String> = []
     static let baseDefinitions: [GFTokenizer.FunctionDefinition] = [
         GFTokenizer.FunctionDefinition(
+            name: "update_scratchpad",
+            description: "Updates the agent's scratchpad with notes, plans, and learnings. This memory is permanent and helps you remember your overarching goals and what you have tried across long debugging sessions.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "notes": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("notes")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
             name: "read_url",
             description: "Fetches the content of a URL and converts the HTML into readable Markdown text.",
             parameters: .object([
@@ -175,6 +186,13 @@ struct ToolRegistry {
             return await executeEditFile(call: call, context: context)
         case "execute_bash":
             return await executeBash(call: call, context: context)
+        case "update_scratchpad":
+            guard let notes = call.stringArgument("notes") else { return "Error: invalid arguments" }
+            if let store = context.scratchpadStore {
+                store.notes = notes
+                return "Scratchpad updated successfully."
+            }
+            return "Error: Scratchpad updates are not supported in this context."
         default:
             if isMCPTool(call.name, definitions: context.definitions) {
                 return await executeMCP(call: call, mcp: context.mcp)
