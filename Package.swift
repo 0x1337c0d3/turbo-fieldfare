@@ -118,14 +118,24 @@ let package = Package(
             dependencies: ["TurboFieldfare"],
             path: "Sources/TurboFieldfareValidation/Support"
         ),
+        .target(
+            name: "AgentLineEditor",
+            linkerSettings: [.linkedLibrary("edit")]
+        ),
         .executableTarget(
             name: "TurboFieldfareAgent",
             dependencies: [
+                "AgentLineEditor",
                 "TurboFieldfare",
                 "TurboFieldfareCLICore",
                 "TurboFieldfareServerCore",
             ],
             path: "Sources/TurboFieldfareAgent"
+        ),
+        .testTarget(
+            name: "TurboFieldfareAgentTests",
+            dependencies: ["TurboFieldfareAgent"],
+            path: "Tests/TurboFieldfareAgent"
         ),
         .testTarget(
             name: "TurboFieldfareFormatTests",

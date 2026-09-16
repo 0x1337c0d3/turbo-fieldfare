@@ -5,8 +5,20 @@ struct AgentConfig {
     let args: Args
     let systemPrompt: String
 
-    init() throws {
-        var rawArgv = Array(CommandLine.arguments.dropFirst())
+    init(arguments: [String] = Array(CommandLine.arguments.dropFirst()),
+         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+         workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) throws {
+        let parsed = try Self.parseArguments(arguments, homeDirectory: homeDirectory)
+        self.args = parsed.args
+        self.systemPrompt = Self.buildSystemPrompt(
+            homeDirectory: homeDirectory, workingDirectory: workingDirectory,
+            agentsFilePath: parsed.agentsFilePath, systemPromptPath: parsed.systemPromptPath)
+    }
+
+    private static func parseArguments(
+        _ arguments: [String], homeDirectory: URL
+    ) throws -> (args: Args, agentsFilePath: String?, systemPromptPath: String?) {
+        var rawArgv = arguments
         var systemPromptPath: String?
         var agentsFilePath: String?
 
@@ -25,13 +37,24 @@ struct AgentConfig {
             }
         }
 
+        if !rawArgv.contains("--model") {
+            let defaultModel = homeDirectory
+                .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
+            rawArgv.append(contentsOf: ["--model", defaultModel.path])
+        }
+
+        if !rawArgv.contains("--max-context") {
+            rawArgv.append(contentsOf: ["--max-context", "262144"])
+        }
+
         if !rawArgv.contains("--prompt") && !rawArgv.contains("--chat-prompt") && !rawArgv.contains("--messages-file") {
             rawArgv.append("--prompt")
             rawArgv.append("agent")
         }
 
+        let parsedArgs: Args
         do {
-            self.args = try Args.parse(rawArgv)
+            parsedArgs = try Args.parse(rawArgv)
         } catch ArgsError.helpRequested {
             print(Args.usage)
             exit(0)
@@ -40,52 +63,34 @@ struct AgentConfig {
             exit(2)
         }
 
+        return (parsedArgs, agentsFilePath, systemPromptPath)
+    }
+
+    private static func buildSystemPrompt(
+        homeDirectory: URL, workingDirectory: URL,
+        agentsFilePath: String?, systemPromptPath: String?
+    ) -> String {
         var masterSystemPrompt = ""
         
-        let fm = FileManager.default
-        let homeDir = fm.homeDirectoryForCurrentUser.path
-        let localDir = fm.currentDirectoryPath
+        let homeDir = homeDirectory.path
+        let localDir = workingDirectory.path
         
         func appendFile(at path: String, header: String? = nil) {
-            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                if let header = header {
-                    if !masterSystemPrompt.isEmpty { masterSystemPrompt += "\n\n" }
-                    masterSystemPrompt += header + "\n"
-                } else if !masterSystemPrompt.isEmpty {
-                    masterSystemPrompt += "\n\n"
-                }
-                masterSystemPrompt += content
-            }
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+            if !masterSystemPrompt.isEmpty { masterSystemPrompt += "\n\n" }
+            if let header { masterSystemPrompt += header + "\n" }
+            masterSystemPrompt += content
         }
         
-        func appendSkills(in directory: String) {
-            let skillsDir = (directory as NSString).appendingPathComponent("skills")
-            if let enumerator = fm.enumerator(atPath: skillsDir) {
-                let files = enumerator.allObjects as? [String] ?? []
-                for file in files.sorted() {
-                    if file.hasSuffix(".md") {
-                        let fullPath = (skillsDir as NSString).appendingPathComponent(file)
-                        appendFile(at: fullPath, header: "## Skill: \(file)")
-                    }
-                }
-            }
-        }
-        
-        // 1. ~/.agents/codex_prompt.md
+        // Global instructions, then project instructions.
         let homeAgentsDir = (homeDir as NSString).appendingPathComponent(".agents")
         appendFile(at: (homeAgentsDir as NSString).appendingPathComponent("codex_prompt.md"))
         
-        // 2. ~/.agents/skills/**
-        appendSkills(in: homeAgentsDir)
-        
-        // 3. ./.agents/codex_prompt.md
+        // Project prompt.
         let localAgentsDir = (localDir as NSString).appendingPathComponent(".agents")
         appendFile(at: (localAgentsDir as NSString).appendingPathComponent("codex_prompt.md"))
         
-        // 4. ./.agents/skills/**
-        appendSkills(in: localAgentsDir)
-        
-        // 5. ./AGENTS.md (or custom agents file from CLI)
+        // Project guidelines or the explicitly selected file.
         if let customAgents = agentsFilePath {
             appendFile(at: customAgents, header: "## Agent Guidelines")
         } else {
@@ -97,7 +102,19 @@ struct AgentConfig {
             appendFile(at: customPrompt)
         }
 
-        // Add MCP tool instructions (see 5)
+        // Keep skill bodies and their reference documents out of every prompt.
+        masterSystemPrompt += """
+
+
+        ## Skills
+        Skills are loaded on demand. The user can list skills with /skills and
+        invoke /<skill> [request] to include that skill's instructions.
+        Skill files live under ~/.agents/skills/ and ./.agents/skills/ as
+        <name>.md or <name>/SKILL.md. Read supporting files only when needed
+        for the active task; do not load the entire skill library.
+        """
+
+        // Add MCP tool instructions
         if !masterSystemPrompt.isEmpty {
             masterSystemPrompt += "\n\n"
         }
@@ -108,6 +125,48 @@ struct AgentConfig {
             masterSystemPrompt = "You are a native Swift agent. You can execute tools natively.\n"
         }
         
-        self.systemPrompt = masterSystemPrompt
+        return masterSystemPrompt
     }
+}
+
+// MCP settings use JSON; environment header values are variable names, not templates.
+struct AgentMCPConfig: Decodable {
+    struct ServerConfig: Decodable {
+        let command: String?
+        let args: [String]?
+        let env: [String: String]?
+        let type: String?
+        let url: String?
+        let headers: [String: String]?
+        let http_headers: [String: String]?
+        let env_http_headers: [String: String]?
+
+        func resolvedHeaders(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> [String: String] {
+            var result: [String: String] = [:]
+            // HTTP header names are case-insensitive. Environment values win.
+            for source in [headers ?? [:], http_headers ?? [:]] {
+                for (name, value) in source { result[name.lowercased()] = value }
+            }
+            for (name, variable) in env_http_headers ?? [:] {
+                guard let value = environment[variable], !value.isEmpty else {
+                    throw HeaderError.missingEnvironmentVariable(variable)
+                }
+                result[name.lowercased()] = value
+            }
+            return result
+        }
+    }
+
+    enum HeaderError: Error, CustomStringConvertible {
+        case missingEnvironmentVariable(String)
+
+        var description: String {
+            switch self {
+            case .missingEnvironmentVariable(let name):
+                return "Required MCP header environment variable \(name) is unset or empty"
+            }
+        }
+    }
+
+    let mcpServers: [String: ServerConfig]?
 }

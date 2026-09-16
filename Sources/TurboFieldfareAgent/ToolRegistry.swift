@@ -1,5 +1,6 @@
 import Foundation
 import TurboFieldfare
+import TurboFieldfareServerCore
 
 struct ToolRegistry {
     nonisolated(unsafe) static var definitions: [GFTokenizer.FunctionDefinition] = baseDefinitions
@@ -108,11 +109,32 @@ struct ToolRegistry {
         )
     ]
 
-        static func reloadMCPTools() async {
+    static func adaptedMCPTools(
+        _ tools: [GFTokenizer.FunctionDefinition],
+        reportError: (String) -> Void = { printColor($0 + "\n", color: "yellow") }
+    ) -> [GFTokenizer.FunctionDefinition] {
+        let reservedNames = Set(baseDefinitions.map(\.name))
+        return tools.compactMap { tool in
+            guard !reservedNames.contains(tool.name) else {
+                reportError("Skipping MCP tool \(tool.name): name is reserved by a built-in tool")
+                return nil
+            }
+            do {
+                return GFTokenizer.FunctionDefinition(
+                    name: tool.name, description: tool.description,
+                    parameters: try GemmaToolSchema.adapted(tool.parameters, toolName: tool.name))
+            } catch {
+                reportError("Skipping MCP tool \(tool.name): \(error)")
+                return nil
+            }
+        }
+    }
+
+    static func reloadMCPTools() async {
         var newDefs = baseDefinitions
         var newMcpTools = Set<String>()
         if let client = MCPClient.shared {
-            let tools = await client.listAllTools()
+            let tools = adaptedMCPTools(await client.listAllTools())
             newDefs.append(contentsOf: tools)
             newMcpTools = Set(tools.map { $0.name })
         }
@@ -121,6 +143,11 @@ struct ToolRegistry {
     }
 
     static func execute(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
+        guard runtime.remainingToolCalls > 0 else { return "Error: tool-call budget exhausted for this user turn" }
+        runtime.remainingToolCalls -= 1
+        guard call.name == "invoke_subagent" || ToolApproval.request(call) else {
+            return "Tool call denied by the user or unavailable in non-interactive mode. Do not retry without a new user request."
+        }
         switch call.name {
         case "invoke_subagent":
             return await executeInvokeSubagent(call: call, runtime: runtime)
@@ -135,174 +162,106 @@ struct ToolRegistry {
         case "execute_bash":
             return executeBash(call: call)
         default:
+            if mcpTools.contains(call.name) {
+                return await executeMCP(call: call)
+            }
             return "Error: unknown tool"
         }
     }
 
     private static func executeInvokeSubagent(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
-        var promptStr = ""
-        if case .object(let map) = call.arguments, case .string(let p) = map["prompt"] { promptStr = p }
+        guard runtime.subagentDepth < 4 else { return "Error: subagent nesting limit reached" }
+        runtime.subagentDepth += 1
+        defer { runtime.subagentDepth -= 1 }
+        let promptStr = call.stringArgument("prompt") ?? ""
 
         printColor("\n--- [Subagent Started] ---\n", color: "blue")
         let subSession = AgentSession(runtime: runtime)
         subSession.messages[0] = GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt + "\n\nYou are a SUBAGENT working on a delegated task. Return the final result clearly.", toolCalls: [], toolCallID: nil, name: nil)
         subSession.messages.append(GFTokenizer.Message(role: .user, content: promptStr, toolCalls: [], toolCallID: nil, name: nil))
 
-        var turnActive = true
-        while turnActive {
-            do {
-                let (content, subCalls) = try await runtime.generate(messages: subSession.messages)
-                var hCalls: [GFTokenizer.HistoricalToolCall] = []
-                for c in subCalls { hCalls.append(GFTokenizer.HistoricalToolCall(id: c.id, name: c.name, arguments: c.arguments)) }
-                subSession.messages.append(GFTokenizer.Message(role: .assistant, content: content.isEmpty ? nil : content, toolCalls: hCalls, toolCallID: nil, name: nil))
-                if !subCalls.isEmpty {
-                    for c in subCalls {
-                        var argString = ""
-                        if case .object(let map) = c.arguments {
-                            if let c = map["command"], case .string(let s) = c { argString = s.replacingOccurrences(of: "\n", with: " ") }
-                            else if let p = map["path"], case .string(let s) = p { argString = s }
-                            else if let q = map["query"], case .string(let s) = q { argString = s }
-                            else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
-                            else if let url = map["url"], case .string(let s) = url { argString = s }
-                            else { argString = map.keys.joined(separator: ", ") }
-                            if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
-                        }
-                        printColor("\n● \(c.name)(\(argString))\n", color: "green")
-                        let rStr = await ToolRegistry.execute(call: c, runtime: runtime)
-                        printColor("   \(rStr.prefix(200))\(rStr.count > 200 ? "..." : "")\n", color: "yellow")
-                        subSession.messages.append(GFTokenizer.Message(role: .tool, content: rStr, toolCalls: [], toolCallID: c.id, name: c.name))
-                    }
-                } else {
-                    turnActive = false
-                }
-            } catch {
-                return "Subagent Error: \(error)"
-            }
+        do {
+            let result = try await subSession.completeTurn(resultLimit: 200)
+            printColor("\n--- [Subagent Finished] ---\n", color: "blue")
+            return result.isEmpty ? "No output from subagent." : result
+        } catch {
+            return "Subagent Error: \(error)"
         }
-        printColor("\n--- [Subagent Finished] ---\n", color: "blue")
-        return subSession.messages.last?.content ?? "No output from subagent."
     }
 
     private static func executeMCP(call: ParsedToolCall) async -> String {
         guard let mcp = MCPClient.shared else { return "Error: MCP Client not initialized" }
-        var args: [String: Any] = [:]
-        if case .object(let map) = call.arguments {
-            for (k, v) in map {
-                if case .string(let s) = v { args[k] = s }
-            }
+        guard let argsData = try? JSONEncoder().encode(call.arguments),
+              let argsJson = String(data: argsData, encoding: .utf8) else {
+            return "Error: invalid MCP arguments"
         }
-        let argsData = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
-        let argsJson = String(data: argsData, encoding: .utf8) ?? "{}"
         return await mcp.callTool(name: call.name, argsJson: argsJson)
     }
 
     private static func executeReadURL(call: ParsedToolCall) async -> String {
-        if case .object(let argsMap) = call.arguments, case .string(let urlStr) = argsMap["url"], let url = URL(string: urlStr) {
-            do {
-                let (data, response) = try await URLSession.shared.data(from: url)
-                guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-                    return "Error: Bad HTTP response"
-                }
-                if let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) {
-                    var text = html
-                    text = text.replacingOccurrences(of: "(?is)<script.*?>.*?</script>", with: "", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?is)<style.*?>.*?</style>", with: "", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?is)<svg.*?>.*?</svg>", with: "", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)</p>", with: "\n\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)</div>", with: "\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)</h1>", with: "\n\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)</h2>", with: "\n\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)</li>", with: "\n", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)<li>", with: "- ", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "(?i)<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>", with: "[$2]($1)", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "&nbsp;", with: " ")
-                    text = text.replacingOccurrences(of: "&amp;", with: "&")
-                    text = text.replacingOccurrences(of: "&lt;", with: "<")
-                    text = text.replacingOccurrences(of: "&gt;", with: ">")
-                    text = text.replacingOccurrences(of: "&quot;", with: "\"")
-                    text = text.replacingOccurrences(of: "&#39;", with: "'")
-                    text = text.replacingOccurrences(of: " {2,}", with: " ", options: [.regularExpression])
-                    text = text.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: [.regularExpression])
-                    return text.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                return "Error: Unable to decode text"
-            } catch {
-                return "Error fetching URL: \(error)"
-            }
-        } else {
+        guard let urlString = call.stringArgument("url"), let url = URL(string: urlString) else {
             return "Error: invalid URL"
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
+                return "Error: Bad HTTP response"
+            }
+            guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
+                return "Error: Unable to decode text"
+            }
+            return ReadableHTML.text(from: html)
+        } catch {
+            return "Error fetching URL: \(error)"
         }
     }
 
     private static func executeReadFile(call: ParsedToolCall) -> String {
-        if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"] {
-            do {
-                let content = try String(contentsOfFile: path, encoding: .utf8)
-                return content
-            } catch {
-                return "Error reading file: \(error)"
-            }
-        } else {
-            return "Error: invalid arguments"
+        guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
+        do {
+            return try String(contentsOfFile: path, encoding: .utf8)
+        } catch {
+            return "Error reading file: \(error)"
         }
     }
 
     private static func executeWriteFile(call: ParsedToolCall) -> String {
-        if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"], case .string(let content) = argsMap["content"] {
-            do {
-                try content.write(toFile: path, atomically: true, encoding: .utf8)
-                return "Successfully wrote to \(path)"
-            } catch {
-                return "Error writing file: \(error)"
-            }
-        } else {
-            return "Error: invalid arguments"
+        guard let path = call.stringArgument("path"),
+              let content = call.stringArgument("content") else { return "Error: invalid arguments" }
+        do {
+            try content.write(toFile: path, atomically: true, encoding: .utf8)
+            return "Successfully wrote to \(path)"
+        } catch {
+            return "Error writing file: \(error)"
         }
     }
 
     private static func executeEditFile(call: ParsedToolCall) -> String {
-        if case .object(let argsMap) = call.arguments, case .string(let path) = argsMap["path"], case .string(let target) = argsMap["target"], case .string(let replacement) = argsMap["replacement"] {
-            do {
-                let content = try String(contentsOfFile: path, encoding: .utf8)
-                guard content.contains(target) else {
-                    return "Error: target string not found in file"
-                }
-                let updated = content.replacingOccurrences(of: target, with: replacement)
-                try updated.write(toFile: path, atomically: true, encoding: .utf8)
-                return "Successfully updated \(path)"
-            } catch {
-                return "Error editing file: \(error)"
-            }
-        } else {
+        guard let path = call.stringArgument("path"),
+              let target = call.stringArgument("target"),
+              let replacement = call.stringArgument("replacement") else {
             return "Error: invalid arguments. Received: \(call.arguments)"
+        }
+        do {
+            let content = try String(contentsOfFile: path, encoding: .utf8)
+            guard content.contains(target) else { return "Error: target string not found in file" }
+            let updated = content.replacingOccurrences(of: target, with: replacement)
+            try updated.write(toFile: path, atomically: true, encoding: .utf8)
+            return "Successfully updated \(path)"
+        } catch {
+            return "Error editing file: \(error)"
         }
     }
 
     private static func executeBash(call: ParsedToolCall) -> String {
-        if case .object(let argsMap) = call.arguments, case .string(let cmd) = argsMap["command"] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["-c", cmd]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            do {
-                try process.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                var outputStr = String(data: data, encoding: .utf8) ?? ""
-                let maxLength = 8192
-                if outputStr.count > maxLength {
-                    outputStr = String(outputStr.prefix(maxLength)) + "\n... (output truncated: too large for context window. please use grep, head, or tail to narrow it down)"
-                }
-                return outputStr
-            } catch {
-                return "Error: \(error)"
-            }
-        } else {
-            return "Error: invalid arguments"
+        guard let command = call.stringArgument("command") else { return "Error: invalid arguments" }
+        do {
+            let output = try ShellCommand.run(command)
+            guard output.count > 8192 else { return output }
+            return String(output.prefix(8192))
+                + "\n... (output truncated: too large for context window. please use grep, head, or tail to narrow it down)"
+        } catch {
+            return "Error: \(error)"
         }
     }
 }

@@ -15,7 +15,12 @@ class AgentRuntime {
     let tokenizer: GFTokenizer
     let config: AgentConfig
 
-    var previousPromptIds: [Int32] = []
+    let statusLine = AgentStatusLine()
+
+    var remainingToolCalls = 64
+    var subagentDepth = 0
+
+    var committedTokenIDs: [Int32] = []
 
     init(config: AgentConfig) async throws {
         self.config = config
@@ -44,18 +49,22 @@ class AgentRuntime {
 
     func generate(messages: [GFTokenizer.Message]) async throws -> (content: String, calls: [ParsedToolCall]) {
         let promptIds = try tokenizer.encodeToolChat(messages: messages, tools: ToolRegistry.definitions)
-        var matchCount = 0
-        for i in 0..<min(previousPromptIds.count, promptIds.count) {
-            if previousPromptIds[i] == promptIds[i] { matchCount += 1 }
-            else { break }
+        let start = AgentPromptCache.start(
+            prompt: promptIds, committed: committedTokenIDs,
+            position: runner.continuationPosition, rewind: runner.rewind(to:))
+        let cachedTokens: Int
+        switch start {
+        case .reset: cachedTokens = 0
+        case .resume(let count): cachedTokens = count
         }
-
-        let start: RawCompletionStart = matchCount > 0 ? .resume(cachedPromptTokens: matchCount) : .reset
+        // Any failure after this point may leave partially advanced KV state.
+        // Only a successful completion supplies a trustworthy token record.
+        committedTokenIDs.removeAll(keepingCapacity: true)
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: Set(ToolRegistry.definitions.map { $0.name }))
 
 
 
-        var currentTokens = promptIds
+        statusLine.beginGeneration(contextTokens: cachedTokens)
 
         let state = AgentState()
 
@@ -88,7 +97,7 @@ class AgentRuntime {
             while read(STDIN_FILENO, &c, 1) > 0 {
                 if stopFlag.waitingForSecondCtrlC {
                     if c == 3 { // Ctrl-C
-                        print("\n[Force Exiting...]")
+                        terminalPrint("\n[Force Exiting...]")
                         exit(1)
                     } else {
                         stopFlag.waitingForSecondCtrlC = false
@@ -97,11 +106,11 @@ class AgentRuntime {
                 }
                 
                 if c == 27 { // ESC
-                    print("\n[Generation Stopped (ESC)]")
+                    terminalPrint("\n[Generation Stopped (ESC)]")
                     stopFlag.stop = true
                     sp.isActive = false
                 } else if c == 3 { // Ctrl-C
-                    print("\n[Press ctrl-c again to exit]")
+                    terminalPrint("\n[Press ctrl-c again to exit]")
                     stopFlag.waitingForSecondCtrlC = true
                     stopFlag.stop = true
                     sp.isActive = false
@@ -119,84 +128,84 @@ class AgentRuntime {
 
         let spinnerTask = Task {
             var i = 0
-            while sp.isActive && !sp.hasStartedOutput {
-                print("\r\u{001B}[34m\(spinnerFrames[i % spinnerFrames.count]) Thinking...\u{001B}[0m\u{001B}[K", terminator: "")
+            while sp.isActive && !sp.hasStartedOutput && !Task.isCancelled {
+                terminalPrint("\r\u{001B}[34m\(spinnerFrames[i % spinnerFrames.count]) Thinking...\u{001B}[0m\u{001B}[K", terminator: "")
                 fflush(stdout)
                 try? await Task.sleep(nanoseconds: 80_000_000)
                 i += 1
             }
             if !sp.hasStartedOutput {
-                print("\r\u{001B}[K", terminator: "")
+                terminalPrint("\r\u{001B}[K", terminator: "")
                 fflush(stdout)
             }
         }
 
-        _ = try await runRawCompletion(
-            producer: runner,
-            tokenizer: tokenizer,
-            promptIds: promptIds,
-            config: GenerationConfig(
-                maxNewTokens: config.args.maxNew,
-                temperature: config.args.temperature,
-                topK: config.args.topK,
-                topP: config.args.topP,
-                repetitionPenalty: config.args.repetitionPenalty,
-                seed: config.args.seed,
-                stopStrings: config.args.stops,
-                extraStopTokens: []
-            ),
-            context: context,
-            scratch: scratch,
-            start: start,
-            shouldStop: { stopFlag.stop || Task.isCancelled },
-            onProgress: { event in
+        func handleDecoderEvents(_ events: [StructuredAssistantEvent]) {
+            for event in events {
                 switch event {
-                case .prefill: break
-                case .token(_, let tokenID, let delta):
-                    currentTokens.append(tokenID)
-                    let decoderEvents = (try? decoder.consume(tokenID: tokenID, delta: delta)) ?? []
-                    for dev in decoderEvents {
-                        switch dev {
-                        case .content(let text):
-                            if !sp.hasStartedOutput {
-                                sp.hasStartedOutput = true
-                                print("\r\u{001B}[K", terminator: "")
-                            }
-                            state.content += text
-                            print(text, terminator: "")
-                            fflush(stdout)
-                        case .toolCall(let call):
-                            state.calls.append(call)
-                            stopFlag.stop = true
-                        }
+                case .content(let text):
+                    if !sp.hasStartedOutput {
+                        sp.hasStartedOutput = true
+                        terminalPrint("\r\u{001B}[K", terminator: "")
                     }
-                case .tail(let text):
-                    let decoderEvents = (try? decoder.consumeTail(text)) ?? []
-                    for dev in decoderEvents {
-                        if case .content(let t) = dev {
-                            if !sp.hasStartedOutput {
-                                sp.hasStartedOutput = true
-                                print("\r\u{001B}[K", terminator: "")
-                            }
-                            state.content += t
-                            print(t, terminator: "")
-                            fflush(stdout)
-                        } else if case .toolCall(let call) = dev {
-                            state.calls.append(call)
-                            stopFlag.stop = true
-                        }
-                    }
+                    state.content += text
+                    terminalPrint(TerminalText.safe(text), terminator: "")
+                case .toolCall(let call):
+                    state.calls.append(call)
+                    stopFlag.stop = true
                 }
             }
-        )
+        }
+
+        let result: RawDecodeResult
+        do {
+            result = try await runRawCompletion(
+                producer: runner,
+                tokenizer: tokenizer,
+                promptIds: promptIds,
+                config: GenerationConfig(
+                    maxNewTokens: config.args.maxNew,
+                    temperature: config.args.temperature,
+                    topK: config.args.topK,
+                    topP: config.args.topP,
+                    repetitionPenalty: config.args.repetitionPenalty,
+                    seed: config.args.seed,
+                    stopStrings: config.args.stops,
+                    extraStopTokens: []
+                ),
+                context: context,
+                scratch: scratch,
+                start: start,
+                shouldStop: { stopFlag.stop || Task.isCancelled },
+                onProgress: { event in
+                    switch event {
+                    case .prefill(let done, _):
+                        self.statusLine.prefill(done: done)
+                    case .token(let index, let tokenID, let delta):
+                        self.statusLine.token(count: index + 1, contextTokens: promptIds.count + index)
+                        handleDecoderEvents((try? decoder.consume(tokenID: tokenID, delta: delta)) ?? [])
+                    case .tail(let text):
+                        handleDecoderEvents((try? decoder.consumeTail(text)) ?? [])
+                    }
+                }
+            )
+        } catch {
+            sp.isActive = false
+            spinnerTask.cancel()
+            _ = await spinnerTask.result
+            statusLine.snapshot.phase = "Error"
+            statusLine.refresh(force: true)
+            throw error
+        }
 
         sp.isActive = false
         _ = await spinnerTask.result
 
         _ = try? decoder.finish()
-        if sp.hasStartedOutput { print("") }
+        if sp.hasStartedOutput { terminalPrint("") }
 
-        self.previousPromptIds = currentTokens
+        statusLine.finish(tokens: result.newTokens, decodeSeconds: result.decodeSeconds, contextTokens: result.kvPosition)
+        self.committedTokenIDs = result.kvBackedTokenIDs
         return (state.content, state.calls)
     }
 }

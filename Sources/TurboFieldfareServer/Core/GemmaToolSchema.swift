@@ -1,6 +1,6 @@
 import TurboFieldfare
 
-enum GemmaToolSchema {
+package enum GemmaToolSchema {
     private static let types: Set<String> = [
         "array", "boolean", "integer", "null", "number", "object", "string",
     ]
@@ -9,7 +9,7 @@ enum GemmaToolSchema {
         "title", "writeOnly",
     ]
 
-    static func adapted(_ schema: JSONValue, toolName: String) throws -> JSONValue {
+    package static func adapted(_ schema: JSONValue, toolName: String) throws -> JSONValue {
         let value = try adapt(schema, toolName: toolName, path: "parameters")
         guard value.objectValue?["type"] == .string("object"),
               value.objectValue?["nullable"] != .bool(true) else {

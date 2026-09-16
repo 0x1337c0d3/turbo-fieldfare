@@ -1,7 +1,7 @@
 import Foundation
 import TurboFieldfare
 
-class AgentSession {
+final class AgentSession {
     let runtime: AgentRuntime
     var messages: [GFTokenizer.Message]
 
@@ -14,20 +14,14 @@ class AgentSession {
 
     private func handleShellCommand(userInput: String) {
         let cmdStr = String(userInput.dropFirst()).trimmingCharacters(in: .whitespaces)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", cmdStr]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
         printColor("\n● Shell: \(cmdStr)\n", color: "green")
-        try? process.run()
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        var outputStr = String(data: data, encoding: .utf8) ?? ""
+        var outputStr: String
+        do {
+            outputStr = try ShellCommand.run(cmdStr)
+        } catch {
+            printColor("Error running shell command: \(error)\n", color: "yellow")
+            return
+        }
         if outputStr.isEmpty { outputStr = "(No output)" }
 
         let displayRes = outputStr.count > 2000 ? String(outputStr.prefix(2000)) + "... (truncated)" : outputStr
@@ -50,144 +44,161 @@ class AgentSession {
         let homeDir = fm.homeDirectoryForCurrentUser.path
         let localDir = fm.currentDirectoryPath
 
+        let skills = SkillLibrary.discover(roots: [
+            URL(fileURLWithPath: homeDir).appendingPathComponent(".agents/skills"),
+            URL(fileURLWithPath: localDir).appendingPathComponent(".agents/skills")
+        ])
         if cmdName.isEmpty || cmdName == "skills" {
-            var availableSkills = Set<String>()
-            let homeSkillsDir = (homeDir as NSString).appendingPathComponent(".agents/skills")
-            let localSkillsDir = (localDir as NSString).appendingPathComponent(".agents/skills")
-            
-            for dir in [homeSkillsDir, localSkillsDir] {
-                if let files = try? fm.contentsOfDirectory(atPath: dir) {
-                    for file in files where file.hasSuffix(".md") {
-                        availableSkills.insert(String(file.dropLast(3)))
-                    }
-                }
-            }
-            
             printColor("\n[Available Skills]:\n", color: "blue")
-            if availableSkills.isEmpty {
+            if skills.isEmpty {
                 printColor("  (No skills found in ~/.agents/skills/ or ./.agents/skills/)\n", color: "gray")
             } else {
-                for skill in availableSkills.sorted() {
+                for skill in skills.keys.sorted() {
                     printColor("  /\(skill)\n", color: "green")
                 }
             }
             return nil
         }
 
-        let homeSkillPath = (homeDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
-        let localSkillPath = (localDir as NSString).appendingPathComponent(".agents/skills/\(cmdName).md")
-        var loadedSkillContent: String?
-        var loadedSkillPath: String?
-        
-        if let content = try? String(contentsOfFile: homeSkillPath, encoding: .utf8) {
-            loadedSkillContent = content
-            loadedSkillPath = homeSkillPath
-        } else if let content = try? String(contentsOfFile: localSkillPath, encoding: .utf8) {
-            loadedSkillContent = content
-            loadedSkillPath = localSkillPath
-        }
-        
+        let loadedSkillPath = skills[cmdName]?.path
+        let loadedSkillContent = loadedSkillPath.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+
         if let skillContent = loadedSkillContent, let skillPath = loadedSkillPath {
             printColor("[Loaded skill /\(cmdName) from \(skillPath)]\n", color: "blue")
-            return "[Skill: \(cmdName)]\n\(skillContent)\n\nUser Request:\n\(args)"
+            return "[Skill: \(cmdName), source: \(skillPath)]\n\(skillContent)\n\nUser Request:\n\(args)"
         } else {
             printColor("Warning: Skill '/\(cmdName)' not found in ~/.agents/skills/ or ./.agents/skills/\n", color: "yellow")
             return nil
         }
     }
 
+    private func printHelp() {
+        printColor("""
+
+        [Agent Help]
+          Enter a message to ask the agent to work. Enter submits the prompt.
+          Shift+Enter inserts a newline (Ctrl+J also works).
+          Ctrl+A/Ctrl+E move to the start/end of the current line.
+          Ctrl+C clears the prompt; press again within 3 seconds to exit.
+          Up/Down browse history until you edit the prompt, then move between lines.
+          Shift+Enter requires a terminal that reports modified Enter keys.
+
+        Commands
+          ?                    Show this help (press Enter).
+          /skills or /         List available slash skills.
+          /<skill> [request]   Load a skill and send it with your request.
+          /prompt              Show the current system prompt.
+          /mcp                 Show configured MCP servers.
+          /mcp reload          Reload MCP configuration and tool definitions.
+          !<command>           Run a shell command; add its output to the conversation.
+          /exit or /quit       Exit the agent.
+
+        Skills
+          Slash skills use <skill>.md or <skill>/SKILL.md in:
+            ~/.agents/skills/  or  ./.agents/skills/
+          If both contain the same name, the home-directory skill takes precedence.
+          Example: review.md is invoked with /review Check my latest changes.
+          Skill instructions are loaded only when invoked, not at startup.
+          Reference documents are read only as needed for the selected skill.
+
+        Built-in tools
+          Ask for these in your message; the agent chooses when to call them.
+          read_file            Read a file.
+          write_file           Write a file.
+          edit_file            Replace matching text in a file.
+          execute_bash         Run a shell command.
+          read_url             Fetch a URL and extract readable text.
+          invoke_subagent      Delegate a task to a subagent.
+
+        """, color: "gray")
+        _ = processSlashCommand(userInput: "/skills")
+    }
+
     func startRepl() async throws {
-        while true {
-            print("")
-            printSeparator()
-            let prompt = "\u{01}\u{001B}[32m\u{02}> \u{01}\u{001B}[0m\u{02}"
-            guard let userInput = ReadlineWrapper.read(prompt: prompt) else { break }
-            printSeparator()
-            
-            if userInput.isEmpty { continue }
-            if userInput == "/exit" || userInput == "/quit" { break }
-            if userInput == "/prompt" {
-                printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
-                continue
-            }
-            if userInput == "/mcp reload" {
-                MCPClient.shared = MCPClient()
-                await ToolRegistry.reloadMCPTools()
-                if MCPClient.shared != nil {
-                    printColor("\n[MCP Client]: Reloaded successfully.\n", color: "green")
-                } else {
-                    printColor("\n[MCP Client]: Failed to reload configuration.\n", color: "red")
-                }
-                continue
-            }
-            if userInput == "/mcp" {
-                if let client = MCPClient.shared {
-                    printColor("\n[MCP Servers]:\n", color: "blue")
-                    for server in client.servers {
-                        
-                        printColor("  - \(server.name) (\(server.connectionDetails))\n", color: "green")
-                    }
-                    if client.servers.isEmpty {
-                        printColor("  (No MCP servers configured or running)\n", color: "gray")
-                    }
-                } else {
-                    printColor("\n[MCP Client]: Not initialized or no configuration found.\n", color: "yellow")
-                }
-                continue
-            }
-
-            if userInput.hasPrefix("!") {
-                handleShellCommand(userInput: userInput)
-                continue
-            }
-
-            var finalInput = userInput
-            if userInput.hasPrefix("/") {
-                guard let processedInput = processSlashCommand(userInput: userInput) else {
-                    continue
-                }
-                finalInput = processedInput
-            }
-
-            messages.append(GFTokenizer.Message(role: .user, content: finalInput, toolCalls: [], toolCallID: nil, name: nil))
-
-            var turnActive = true
-            while turnActive {
-                do {
-                    let (content, calls) = try await runtime.generate(messages: messages)
-                    var hCalls: [GFTokenizer.HistoricalToolCall] = []
-                    for call in calls {
-                        hCalls.append(GFTokenizer.HistoricalToolCall(id: call.id, name: call.name, arguments: call.arguments))
-                    }
-                    messages.append(GFTokenizer.Message(role: .assistant, content: content.isEmpty ? nil : content, toolCalls: hCalls, toolCallID: nil, name: nil))
-
-                    if !calls.isEmpty {
-                        for call in calls {
-                            var argString = ""
-                            if case .object(let map) = call.arguments {
-                                if let c = map["command"], case .string(let s) = c { argString = s.replacingOccurrences(of: "\n", with: " ") }
-                                else if let p = map["path"], case .string(let s) = p { argString = s }
-                                else if let q = map["query"], case .string(let s) = q { argString = s }
-                                else if let pr = map["prompt"], case .string(let s) = pr { argString = s }
-                                else if let url = map["url"], case .string(let s) = url { argString = s }
-                                else { argString = map.keys.joined(separator: ", ") }
-                                if argString.count > 60 { argString = String(argString.prefix(60)) + "..." }
-                            }
-                            printColor("\n● \(call.name)(\(argString))\n", color: "green")
-                            let resultStr = await ToolRegistry.execute(call: call, runtime: runtime)
-                            printColor("   \(resultStr.prefix(300))\(resultStr.count > 300 ? "..." : "")\n", color: "yellow")
-                            messages.append(GFTokenizer.Message(role: .tool, content: resultStr, toolCalls: [], toolCallID: call.id, name: call.name))
-                        }
-                    } else {
-                        turnActive = false
-                    }
-                } catch {
-                    printColor("\n[Error: \(error)]\n", color: "yellow")
-                    // Pop the offending message so the user can continue
-                    if !messages.isEmpty { messages.removeLast() }
-                    turnActive = false
-                }
-                }
+        runtime.statusLine.start(maxContext: runtime.config.args.maxContext)
+        defer { runtime.statusLine.stop() }
+        printColor("\nType ? and press Enter for commands, skills, and built-in tools.\n", color: "gray")
+        while let input = readInput() {
+            if input == "/exit" || input == "/quit" { break }
+            if await handleCommand(input) { continue }
+            guard let prompt = processSlashCommand(userInput: input) else { continue }
+            runtime.remainingToolCalls = 64
+            let priorMessageCount = messages.count
+            messages.append(GFTokenizer.Message(role: .user, content: prompt, toolCalls: [], toolCallID: nil, name: nil))
+            do {
+                _ = try await completeTurn()
+            } catch {
+                printColor("\n[Error: \(error)]\n", color: "yellow")
+                // Keep completed tool-call/result pairs if a later generation fails.
+                if messages.count == priorMessageCount + 1 { messages.removeLast() }
             }
         }
     }
+
+    func completeTurn(resultLimit: Int = 300) async throws -> String {
+        try await ConversationTurn.run(
+            messages: &messages,
+            generate: { [runtime] in try await runtime.generate(messages: $0) },
+            execute: { [runtime] call in
+                printColor("\n● \(call.name)(\(call.argumentSummary))\n", color: "green")
+                let result = await ToolRegistry.execute(call: call, runtime: runtime)
+                let suffix = result.count > resultLimit ? "..." : ""
+                printColor("   \(result.prefix(resultLimit))\(suffix)\n", color: "yellow")
+                return result
+            })
+    }
+
+    private func readInput() -> String? {
+        print("")
+        printSeparator()
+        runtime.statusLine.preparePrompt()
+        let prompt = "\u{01}\u{001B}[32m\u{02}> \u{01}\u{001B}[0m\u{02}"
+        guard let input = ReadlineWrapper.read(prompt: prompt) else { return nil }
+        printSeparator()
+        return input
+    }
+
+    private func handleCommand(_ input: String) async -> Bool {
+        if input.trimmingCharacters(in: .whitespacesAndNewlines) == "?" {
+            printHelp()
+            return true
+        }
+        switch input {
+        case "": break
+        case "/prompt":
+            printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
+        case "/mcp reload":
+            await reloadMCP()
+        case "/mcp":
+            printMCPServers()
+        case _ where input.hasPrefix("!"):
+            handleShellCommand(userInput: input)
+        default: return false
+        }
+        return true
+    }
+
+    private func reloadMCP() async {
+        MCPClient.shared = MCPClient()
+        await ToolRegistry.reloadMCPTools()
+        guard MCPClient.shared != nil else {
+            printColor("\n[MCP Client]: Failed to reload configuration.\n", color: "red")
+            return
+        }
+        printColor("\n[MCP Client]: Reloaded successfully.\n", color: "green")
+    }
+
+    private func printMCPServers() {
+        guard let client = MCPClient.shared else {
+            printColor("\n[MCP Client]: Not initialized or no configuration found.\n", color: "yellow")
+            return
+        }
+        printColor("\n[MCP Servers]:\n", color: "blue")
+        for server in client.servers {
+            printColor("  - \(server.name) (\(server.connectionDetails))\n", color: "green")
+        }
+        if client.servers.isEmpty {
+            printColor("  (No MCP servers configured or running)\n", color: "gray")
+        }
+    }
+}

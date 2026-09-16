@@ -1,4 +1,5 @@
 import Foundation
+import AgentLineEditor
 import TurboFieldfare
 import TurboFieldfareCLICore
 
@@ -13,7 +14,7 @@ func printColor(_ text: String, color: String) {
     case "gray": colorCode = "\u{001B}[90m"
     default: colorCode = ""
     }
-    print("\(colorCode)\(text)\u{001B}[0m", terminator: "")
+    terminalPrint("\(colorCode)\(TerminalText.safe(text))\u{001B}[0m", terminator: "")
     fflush(stdout)
 }
 
@@ -30,15 +31,7 @@ func printSeparator() {
     printColor(String(repeating: "─", count: width) + "\n", color: "gray")
 }
 
-typealias ReadlineFunc = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
-typealias AddHistoryFunc = @convention(c) (UnsafePointer<CChar>?) -> Void
-typealias HistoryIOFunc = @convention(c) (UnsafePointer<CChar>?) -> Int32
-
 struct ReadlineWrapper {
-    nonisolated(unsafe) static var readline: ReadlineFunc?
-    nonisolated(unsafe) static var addHistory: AddHistoryFunc?
-    nonisolated(unsafe) static var writeHistory: HistoryIOFunc?
-
     static var historyFilePath: String? {
         guard let home = ProcessInfo.processInfo.environment["HOME"] else { return nil }
         let dir = home + "/.cache/TurboFieldfareAgent"
@@ -51,34 +44,8 @@ struct ReadlineWrapper {
     nonisolated(unsafe) static var lastCtrlCTime = Date.distantPast
 
     static func setup() {
-        if let handle = dlopen("/usr/lib/libedit.dylib", RTLD_NOW) {
-            typealias RlBindFunc = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32
-            if let sym = dlsym(handle, "rl_variable_bind") {
-                let bind = unsafeBitCast(sym, to: RlBindFunc.self)
-                _ = bind("editing-mode", "emacs")
-            }
-            typealias VoidFunc = @convention(c) () -> Void
-            if let sym = dlsym(handle, "using_history") {
-                let usingHistory = unsafeBitCast(sym, to: VoidFunc.self)
-                usingHistory()
-            }
-            if let sym = dlsym(handle, "readline") {
-                readline = unsafeBitCast(sym, to: ReadlineFunc.self)
-            }
-            if let sym = dlsym(handle, "add_history") {
-                addHistory = unsafeBitCast(sym, to: AddHistoryFunc.self)
-            }
-            if let sym = dlsym(handle, "read_history") {
-                let readHistory = unsafeBitCast(sym, to: HistoryIOFunc.self)
-                if let path = historyFilePath {
-                    _ = readHistory(path)
-                }
-            }
-            if let sym = dlsym(handle, "write_history") {
-                writeHistory = unsafeBitCast(sym, to: HistoryIOFunc.self)
-            }
-        }
-        
+        // libedit decodes input using the process character locale.
+        setlocale(LC_CTYPE, "")
         sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
         sigintSource?.setEventHandler {
             if Date().timeIntervalSince(lastCtrlCTime) > 3.0 {
@@ -98,27 +65,24 @@ struct ReadlineWrapper {
     }
 
     static func read(prompt: String) -> String? {
-        if readline == nil { setup() }
-
-        if let rl = readline {
-            guard let cStr = rl(prompt) else { return nil }
-            ctrlCCount = 0 // reset on success
-            signal(SIGINT, SIG_IGN)
-            defer { free(cStr) }
-            
-            let str = String(cString: cStr)
-            if !str.isEmpty {
-                addHistory?(cStr)
-                if let path = historyFilePath {
-                    _ = writeHistory?(path)
-                }
-            }
-            return str
-        } else {
-            print(prompt, terminator: "")
-            fflush(stdout)
+        if sigintSource == nil { setup() }
+        guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1,
+              ProcessInfo.processInfo.environment["TERM"] != "dumb" else {
             return Swift.readLine()
         }
+        // Native libedit uses one delimiter for both ends of invisible ANSI spans.
+        let nativePrompt = prompt.replacingOccurrences(of: "\u{02}", with: "\u{01}")
+        let input = nativePrompt.withCString { promptPointer in
+            if let path = historyFilePath {
+                return path.withCString { agent_read_prompt(promptPointer, $0) }
+            }
+            return agent_read_prompt(promptPointer, nil)
+        }
+        guard let input else { return nil }
+        defer { free(input) }
+        ctrlCCount = 0
+        signal(SIGINT, SIG_IGN)
+        return String(cString: input)
     }
 }
 
@@ -129,6 +93,7 @@ struct AgentCLI {
     static func main() async throws {
         let config = try AgentConfig()
         let runtime = try await AgentRuntime(config: config)
+        await ToolRegistry.reloadMCPTools()
         let session = AgentSession(runtime: runtime)
         try await session.startRepl()
     }
