@@ -17,6 +17,7 @@ public struct Args: Equatable, Sendable {
     public var seed: UInt64?
     public var stops: [String]
     public var quiet: Bool
+    public var yolo: Bool
     public var expertCacheSlots: Int
     public var expertCachePolicy: RuntimeExpertCachePolicy
     public var prefillPolicy: RuntimePrefillPolicy
@@ -42,6 +43,7 @@ public struct Args: Equatable, Sendable {
                 seed: UInt64? = nil,
                 stops: [String] = [],
                 quiet: Bool = false,
+                yolo: Bool = false,
                 expertCacheSlots: Int = RuntimeConfiguration.production.expertCacheSlots,
                 expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
                 prefillPolicy: RuntimePrefillPolicy = RuntimeConfiguration.production.prefillPolicy,
@@ -64,6 +66,7 @@ public struct Args: Equatable, Sendable {
         self.seed = seed
         self.stops = stops
         self.quiet = quiet
+        self.yolo = yolo
         self.expertCacheSlots = expertCacheSlots
         self.expertCachePolicy = expertCachePolicy
         self.prefillPolicy = prefillPolicy
@@ -139,6 +142,7 @@ extension Args {
       --seed <uint64>            Deterministic sampling seed (default off).
       --stop <string>            Stop substring (repeatable).
       --quiet                    Suppress the timing footer.
+      --yolo                     Automatically allow all tool calls without confirmation.
       --expert-cache-slots <n>   Expert-cache slots: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedExpertCacheSlots)) (default 16).
       --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
@@ -207,6 +211,7 @@ extension Args {
         var seed: UInt64?
         var stops: [String] = []
         var quiet = false
+        var yolo = false
         let runtimeDefaults = RuntimeConfiguration.production
         var expertCacheSlots = runtimeDefaults.expertCacheSlots
         var expertCachePolicy = runtimeDefaults.expertCachePolicy
@@ -223,6 +228,9 @@ extension Args {
                 throw ArgsError.helpRequested
             case "--quiet":
                 quiet = true
+                index += 1
+            case "--yolo":
+                yolo = true
                 index += 1
             case "--model":
                 model = try takeValue(argv, &index, flag: flag)
@@ -382,6 +390,7 @@ extension Args {
                              seed: seed,
                              stops: stops,
                              quiet: quiet,
+                             yolo: yolo,
                              expertCacheSlots: expertCacheSlots,
                              expertCachePolicy: expertCachePolicy,
                              prefillPolicy: prefillPolicy,

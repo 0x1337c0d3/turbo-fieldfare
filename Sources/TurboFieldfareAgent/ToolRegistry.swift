@@ -165,7 +165,8 @@ struct ToolRegistry {
         guard runtime.remainingToolCalls > 0 else { return "Error: tool-call budget exhausted for this user turn" }
         runtime.remainingToolCalls -= 1
         let approved: Bool
-        if call.name == "invoke_subagent" { approved = true }
+        if runtime.config.args.yolo { approved = true }
+        else if call.name == "invoke_subagent" { approved = true }
         else if let interaction = context.interaction { approved = await interaction.approve(call) }
         else { approved = ToolApproval.request(call) }
         guard approved else {
