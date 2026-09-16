@@ -1,6 +1,12 @@
 import Foundation
 import TurboFieldfare
 
+enum RoutingMode: String {
+    case auto = "Auto (Hybrid)"
+    case forceLocal = "Local (Embedded)"
+    case forceCloud = "Remote (OpenAI)"
+}
+
 final class AgentState: @unchecked Sendable {
     var content = ""
     var calls: [ParsedToolCall] = []
@@ -22,6 +28,9 @@ final class AgentRuntime: @unchecked Sendable {
     var subagentDepth = 0
 
     var lastStopReason: StopReason = .endOfTurn
+
+    var routingMode: RoutingMode = .auto
+    var openAIClient: OpenAIClient? = OpenAIClient()
 
     var committedTokenIDs: [Int32] = []
 
@@ -54,6 +63,55 @@ final class AgentRuntime: @unchecked Sendable {
                   tools: [GFTokenizer.FunctionDefinition]? = nil,
                   interaction: AgentInteraction? = nil) async throws -> (content: String, calls: [ParsedToolCall]) {
         let definitions = tools ?? ToolRegistry.definitions
+        
+        var target: RouteTarget = .local
+        switch routingMode {
+        case .forceLocal:
+            target = .local
+        case .forceCloud:
+            target = .cloud
+        case .auto:
+            let router = HybridRouter(localRuntime: self, cloudClient: openAIClient)
+            target = try await router.decide(messages: messages)
+        }
+        
+        if target == .cloud, let client = openAIClient {
+            if interaction == nil { terminalPrint("\n\u{001B}[33m[Auto-Routed to Cloud (OpenAI)]\u{001B}[0m\n") }
+            do {
+                let result = try await client.generate(messages: messages, tools: definitions)
+                if interaction == nil { terminalPrint(result.content) }
+                else { interaction?.text(result.content) }
+                lastStopReason = .endOfTurn
+                return result
+            } catch {
+                if interaction == nil { terminalPrint("\n\u{001B}[31m[Cloud route failed: \(error). Falling back to Local...]\u{001B}[0m\n") }
+                return try await generateLocally(messages: messages, tools: definitions, interaction: interaction)
+            }
+        } else {
+            if routingMode == .auto && interaction == nil { terminalPrint("\n\u{001B}[32m[Auto-Routed to Local (Embedded)]\u{001B}[0m\n") }
+            do {
+                return try await generateLocally(messages: messages, tools: definitions, interaction: interaction)
+            } catch {
+                if let client = openAIClient {
+                    if interaction == nil { terminalPrint("\n\u{001B}[31m[Local route failed: \(error). Falling back to Cloud...]\u{001B}[0m\n") }
+                    let result = try await client.generate(messages: messages, tools: definitions)
+                    if interaction == nil { terminalPrint(result.content) }
+                    else { interaction?.text(result.content) }
+                    lastStopReason = .endOfTurn
+                    return result
+                } else {
+                    throw error
+                }
+            }
+        }
+    }
+
+    func generateLocally(messages: [GFTokenizer.Message],
+                         tools: [GFTokenizer.FunctionDefinition]? = nil,
+                         interaction: AgentInteraction? = nil,
+                         maxNewTokensOverride: Int? = nil,
+                         silent: Bool = false) async throws -> (content: String, calls: [ParsedToolCall]) {
+        let definitions = tools ?? ToolRegistry.definitions
         let promptIds = try tokenizer.encodeToolChat(messages: messages, tools: definitions)
         let start = AgentPromptCache.start(
             prompt: promptIds, committed: committedTokenIDs,
@@ -63,17 +121,15 @@ final class AgentRuntime: @unchecked Sendable {
         case .reset: cachedTokens = 0
         case .resume(let count): cachedTokens = count
         }
-        // Any failure after this point may leave partially advanced KV state.
-        // Only a successful completion supplies a trustworthy token record.
-        committedTokenIDs.removeAll(keepingCapacity: true)
+        
+        if !silent { committedTokenIDs.removeAll(keepingCapacity: true) }
         let decoder = StructuredAssistantDecoder(tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }))
 
-
-        if interaction == nil { statusLine.beginGeneration(contextTokens: cachedTokens) }
+        if interaction == nil && !silent { statusLine.beginGeneration(contextTokens: cachedTokens) }
         let state = AgentState()
         let cancellation = interaction?.cancellation ?? AgentCancellation()
         let stopAfterTool = AgentCancellation()
-        let terminal = interaction == nil ? TerminalGeneration(cancellation: cancellation) : nil
+        let terminal = (interaction == nil && !silent) ? TerminalGeneration(cancellation: cancellation) : nil
         defer { terminal?.restore() }
 
         func handleDecoderEvents(_ events: [StructuredAssistantEvent]) {
@@ -81,8 +137,10 @@ final class AgentRuntime: @unchecked Sendable {
                 switch event {
                 case .content(let text):
                     state.content += text
-                    if let interaction { interaction.text(text) }
-                    else { terminal?.text(text) }
+                    if !silent {
+                        if let interaction { interaction.text(text) }
+                        else { terminal?.text(text) }
+                    }
                 case .toolCall(let call):
                     state.calls.append(call)
                     stopAfterTool.cancel()
@@ -97,7 +155,7 @@ final class AgentRuntime: @unchecked Sendable {
                 tokenizer: tokenizer,
                 promptIds: promptIds,
                 config: GenerationConfig(
-                    maxNewTokens: config.args.maxNew,
+                    maxNewTokens: maxNewTokensOverride ?? config.args.maxNew,
                     temperature: config.args.temperature,
                     topK: config.args.topK,
                     topP: config.args.topP,
@@ -113,9 +171,9 @@ final class AgentRuntime: @unchecked Sendable {
                 onProgress: { event in
                     switch event {
                     case .prefill(let done, _):
-                        if interaction == nil { self.statusLine.prefill(done: done) }
+                        if interaction == nil && !silent { self.statusLine.prefill(done: done) }
                     case .token(let index, let tokenID, let delta):
-                        if interaction == nil { self.statusLine.token(count: index + 1, contextTokens: promptIds.count + index) }
+                        if interaction == nil && !silent { self.statusLine.token(count: index + 1, contextTokens: promptIds.count + index) }
                         handleDecoderEvents((try? decoder.consume(tokenID: tokenID, delta: delta)) ?? [])
                     case .tail(let text):
                         handleDecoderEvents((try? decoder.consumeTail(text)) ?? [])
@@ -123,23 +181,27 @@ final class AgentRuntime: @unchecked Sendable {
                 }
             )
         } catch {
-            await terminal?.finish()
-            statusLine.snapshot.phase = "Error"
-            statusLine.refresh(force: true)
+            if !silent {
+                await terminal?.finish()
+                statusLine.snapshot.phase = "Error"
+                statusLine.refresh(force: true)
+            }
             throw error
         }
 
-        await terminal?.finish()
-
+        if !silent { await terminal?.finish() }
         _ = try? decoder.finish()
 
-        if interaction == nil { statusLine.finish(tokens: result.newTokens, decodeSeconds: result.decodeSeconds, contextTokens: result.kvPosition) }
-        lastStopReason = result.reason
-        if interaction?.cancellation.isCancelled == true || Task.isCancelled {
-            committedTokenIDs.removeAll()
-            throw CancellationError()
+        if interaction == nil && !silent { statusLine.finish(tokens: result.newTokens, decodeSeconds: result.decodeSeconds, contextTokens: result.kvPosition) }
+        
+        if !silent {
+            lastStopReason = result.reason
+            if interaction?.cancellation.isCancelled == true || Task.isCancelled {
+                committedTokenIDs.removeAll()
+                throw CancellationError()
+            }
+            self.committedTokenIDs = result.kvBackedTokenIDs
         }
-        self.committedTokenIDs = result.kvBackedTokenIDs
         return (state.content, state.calls)
     }
 }

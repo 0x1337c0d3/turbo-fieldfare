@@ -134,6 +134,16 @@ final class AgentSession {
     func startRepl() async throws {
         runtime.statusLine.start(maxContext: runtime.config.args.maxContext)
         AgentTerminal.beginTranscript()
+        AgentTerminal.onToggleMode = { [weak self] in
+            guard let self = self else { return }
+            switch self.runtime.routingMode {
+            case .auto: self.runtime.routingMode = .forceCloud
+            case .forceCloud: self.runtime.routingMode = .forceLocal
+            case .forceLocal: self.runtime.routingMode = .auto
+            }
+            printColor("\n[Switched to \(self.runtime.routingMode.rawValue)]\n", color: "yellow")
+        }
+        
         defer {
             AgentTerminal.endTranscript()
             runtime.statusLine.stop()

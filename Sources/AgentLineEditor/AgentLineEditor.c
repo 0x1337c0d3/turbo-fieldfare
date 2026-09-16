@@ -154,6 +154,11 @@ static unsigned char transcript_action(EditLine *editor, int action) {
     return CC_NORM;
 }
 
+static unsigned char toggle_mode(EditLine *editor, int key) {
+    (void)key;
+    return transcript_action(editor, 2); // 2 could mean toggle mode
+}
+
 static unsigned char toggle_tools(EditLine *editor, int key) {
     (void)key;
     return transcript_action(editor, 0);
@@ -186,6 +191,10 @@ static void configure_keys(EditLine *editor) {
     el_set(editor, EL_ADDFN, "agent-toggle-tools", "Expand/collapse tool responses", toggle_tools);
     el_set(editor, EL_ADDFN, "agent-transcript-up", "Previous transcript page", transcript_up);
     el_set(editor, EL_ADDFN, "agent-transcript-down", "Next transcript page", transcript_down);
+    el_set(editor, EL_ADDFN, "agent-toggle-mode", "Toggle local/remote mode", toggle_mode);
+    bind_key(editor, "^[[Z", "agent-toggle-mode"); // Shift-Tab
+    bind_key(editor, "^[[9;2u", "agent-toggle-mode"); // Kitty Shift-Tab
+    bind_key(editor, "^[[27;2;9~", "agent-toggle-mode"); // XTerm Shift-Tab
     bind_key(editor, "^O", "agent-toggle-tools");
     bind_key(editor, "^[[111;5u", "agent-toggle-tools");
     bind_key(editor, "^[[27;5;111~", "agent-toggle-tools");

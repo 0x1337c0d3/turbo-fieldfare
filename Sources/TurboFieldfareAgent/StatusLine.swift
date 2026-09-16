@@ -57,11 +57,15 @@ enum AgentTerminal {
         }
     }
 
+    nonisolated(unsafe) static var onToggleMode: (() -> Void)? = nil
+
     /// action: 0 toggles tools; -1/+1 page up/down. The editor redraws its own
     /// draft after this returns, at the cursor position reserved for it here.
     @discardableResult
     static func navigate(_ action: Int, promptRows: Int) -> Bool {
-        lock.withLock {
+        if action == 2 { onToggleMode?(); return true }
+
+        return lock.withLock {
             guard let size, transcript?.hasTools == true else { return false }
             if action == 0 {
                 transcript?.toggle()
