@@ -17,7 +17,7 @@ final class TerminalGeneration: @unchecked Sendable {
         guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else { return }
         tcgetattr(STDIN_FILENO, &originalTermios)
         var raw = originalTermios
-        raw.c_lflag &= ~UInt(ICANON | ECHO | ISIG)
+        raw.c_lflag &= ~UInt(ICANON | ECHO | ISIG | IEXTEN)
         raw.c_cc.16 = 1
         raw.c_cc.17 = 0
         tcsetattr(STDIN_FILENO, TCSANOW, &raw)
@@ -33,7 +33,7 @@ final class TerminalGeneration: @unchecked Sendable {
             while let self, !Task.isCancelled {
                 let drawn = self.lock.withLock {
                     guard self.active, !self.hasText else { return false }
-                    terminalPrint("\r\u{001B}[34m\(frames[index % frames.count]) Thinking...\u{001B}[0m\u{001B}[K", terminator: "")
+                    AgentTerminal.write("\r\u{001B}[34m\(frames[index % frames.count]) Thinking...\u{001B}[0m\u{001B}[K")
                     return true
                 }
                 if !drawn { break }
@@ -44,8 +44,13 @@ final class TerminalGeneration: @unchecked Sendable {
     }
 
     private func readKeys() {
-        while let byte = nextByte() {
-            if byte == 3 {
+        while let key = nextKey() {
+            if key == .toggleTools {
+                lock.withLock {
+                    waitingForSecondCtrlC = false
+                    AgentTerminal.navigate(0, promptRows: 0)
+                }
+            } else if key == .interrupt {
                 let exitNow = lock.withLock {
                     let previous = waitingForSecondCtrlC
                     waitingForSecondCtrlC = true
@@ -55,7 +60,7 @@ final class TerminalGeneration: @unchecked Sendable {
                 if exitNow { restore(); exit(1) }
                 terminalPrint("\n[Press ctrl-c again to exit]")
                 cancellation.cancel()
-            } else if byte == 27 {
+            } else if key == .stop {
                 cancellation.cancel()
                 lock.withLock { active = false }
                 terminalPrint("\n[Generation Stopped (ESC)]")
@@ -63,6 +68,23 @@ final class TerminalGeneration: @unchecked Sendable {
                 lock.withLock { waitingForSecondCtrlC = false }
             }
         }
+    }
+
+    private func nextKey() -> TerminalGenerationKey? {
+        guard let byte = nextByte() else { return nil }
+        var bytes = [byte]
+        if byte == 27 {
+            // Distinguish standalone Escape from enhanced keyboard sequences.
+            // poll also handles a sequence split across DispatchSource events.
+            while bytes.count < 32 {
+                var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+                guard poll(&descriptor, 1, 30) > 0, let next = nextByte() else { break }
+                bytes.append(next)
+                if bytes.count == 2 && next != 91 && next != 79 { break }
+                if bytes.count > 2 && (64...126).contains(next) { break }
+            }
+        }
+        return TerminalGenerationKey.decode(bytes)
     }
 
     private func nextByte() -> UInt8? {
@@ -75,7 +97,7 @@ final class TerminalGeneration: @unchecked Sendable {
 
     func text(_ text: String) {
         lock.withLock {
-            if !hasText, keyboard != nil { terminalPrint("\r\u{001B}[K", terminator: "") }
+            if !hasText, keyboard != nil { AgentTerminal.write("\r\u{001B}[K") }
             hasText = true
             terminalPrint(TerminalText.safe(text), terminator: "")
         }
@@ -87,7 +109,7 @@ final class TerminalGeneration: @unchecked Sendable {
         await spinner?.value
         lock.withLock {
             if hasText { terminalPrint("") }
-            else if keyboard != nil { terminalPrint("\r\u{001B}[K", terminator: "") }
+            else if keyboard != nil { AgentTerminal.write("\r\u{001B}[K") }
         }
     }
 
@@ -98,6 +120,19 @@ final class TerminalGeneration: @unchecked Sendable {
             self.keyboard = nil
             _ = fcntl(STDIN_FILENO, F_SETFL, originalFlags)
             tcsetattr(STDIN_FILENO, TCSANOW, &originalTermios)
+        }
+    }
+}
+
+enum TerminalGenerationKey {
+    case toggleTools, interrupt, stop, ignored
+
+    static func decode(_ bytes: [UInt8]) -> Self {
+        switch String(decoding: bytes, as: UTF8.self) {
+        case "\u{0F}", "\u{001B}[111;5u", "\u{001B}[27;5;111~": return .toggleTools
+        case "\u{03}", "\u{001B}[99;5u", "\u{001B}[27;5;99~": return .interrupt
+        case "\u{001B}", "\u{001B}[27u": return .stop
+        default: return .ignored
         }
     }
 }

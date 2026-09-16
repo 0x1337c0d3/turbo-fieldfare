@@ -4,6 +4,107 @@ import Darwin
 /// Serializes footer cursor movements with streamed output and the thinking spinner.
 enum AgentTerminal {
     private static let lock = NSRecursiveLock()
+    nonisolated(unsafe) private static var transcript: TerminalTranscript?
+    nonisolated(unsafe) private static var footer: AgentStatusSnapshot?
+
+    static func rememberFooter(_ snapshot: AgentStatusSnapshot) {
+        lock.withLock { footer = snapshot }
+    }
+
+    static var size: (rows: Int, columns: Int)? {
+        guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1,
+              ProcessInfo.processInfo.environment["TERM"] != "dumb" else { return nil }
+        var size = winsize()
+        guard ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0,
+              size.ws_row >= 3, size.ws_col >= 2 else { return nil }
+        return (Int(size.ws_row), Int(size.ws_col))
+    }
+
+    static func beginTranscript() {
+        lock.withLock { transcript = size == nil ? nil : TerminalTranscript() }
+    }
+
+    static func endTranscript() {
+        lock.withLock { transcript = nil }
+    }
+
+    static func output(_ text: String) {
+        lock.withLock {
+            transcript?.append(text)
+            write(text)
+        }
+    }
+
+    static func toolResult(_ result: String, limit: Int) {
+        lock.withLock {
+            if let text = transcript?.appendTool(result, limit: limit) {
+                write(text)
+            } else {
+                let limit = max(0, limit)
+                let suffix = result.count > limit ? "..." : ""
+                write("\u{001B}[33m   \(TerminalText.safe(String(result.prefix(limit))))\(suffix)\u{001B}[0m\n")
+            }
+        }
+    }
+
+    static func recordPrompt(_ input: String) {
+        lock.withLock {
+            transcript?.append("\u{001B}[32m> \u{001B}[0m" + TerminalText.safe(input) + "\n")
+            if let offset = transcript?.scrollOffset, offset > 0 {
+                transcript?.scrollOffset = 0
+                repaint(promptRows: 0)
+            }
+        }
+    }
+
+    /// action: 0 toggles tools; -1/+1 page up/down. The editor redraws its own
+    /// draft after this returns, at the cursor position reserved for it here.
+    @discardableResult
+    static func navigate(_ action: Int, promptRows: Int) -> Bool {
+        lock.withLock {
+            guard let size, transcript?.hasTools == true else { return false }
+            if action == 0 {
+                transcript?.toggle()
+            } else {
+                let page = max(1, size.rows - 1 - promptRows)
+                transcript?.scrollOffset += action < 0 ? page : -page
+            }
+            repaint(promptRows: promptRows)
+            return true
+        }
+    }
+
+    private static func repaint(promptRows: Int) {
+        guard let size, var content = transcript else { return }
+        // Leave the final column unused to avoid pending terminal autowrap.
+        var rows = content.rows(width: size.columns - 1)
+        let reserved = min(max(0, promptRows), size.rows - 2)
+        let height = size.rows - 1 - reserved
+        // A trailing empty line is the editor's insertion point, not transcript.
+        if reserved > 0, rows.last == "\u{001B}[0m" { rows.removeLast() }
+        content.scrollOffset = min(max(0, content.scrollOffset), max(0, rows.count - height))
+        transcript = content
+        let end = rows.count - content.scrollOffset
+        let visible = Array(rows[max(0, end - height)..<end])
+        let padding = height - visible.count
+        var output = "\u{001B}[0m\u{001B}[1;\(size.rows - 1)r"
+        if let footer {
+            output += "\u{001B}[\(size.rows);1H\u{001B}[2K\u{001B}[90m"
+            output += footer.text(width: size.columns) + "\u{001B}[0m"
+        }
+        for row in 0..<(size.rows - 1) {
+            output += "\u{001B}[\(row + 1);1H\u{001B}[2K"
+            let index = row - padding
+            if row < height, index >= 0, index < visible.count { output += visible[index] }
+        }
+        if reserved > 0 {
+            output += "\u{001B}[\(height + 1);1H"
+        } else {
+            // Streaming resumes at the end of the retained last row.
+            output += "\u{001B}[\(height);1H" + (visible.last ?? "")
+        }
+        write(output)
+    }
 
     static func write(_ text: String) {
         lock.lock()
@@ -14,7 +115,7 @@ enum AgentTerminal {
 }
 
 func terminalPrint(_ text: String = "", terminator: String = "\n") {
-    AgentTerminal.write(text + terminator)
+    AgentTerminal.output(text + terminator)
 }
 
 struct AgentStatusSnapshot {
@@ -115,6 +216,7 @@ final class AgentStatusLine {
         guard force || now - lastDraw >= 0.25 || rows != size.rows else { return }
         lastDraw = now
         snapshot.memoryBytes = Self.processFootprint()
+        AgentTerminal.rememberFooter(snapshot)
         var output = ""
         if rows != size.rows {
             rows = size.rows

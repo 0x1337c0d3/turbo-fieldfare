@@ -74,9 +74,15 @@ struct ReadlineWrapper {
         let nativePrompt = prompt.replacingOccurrences(of: "\u{02}", with: "\u{01}")
         let input = nativePrompt.withCString { promptPointer in
             if let path = historyFilePath {
-                return path.withCString { agent_read_prompt(promptPointer, $0) }
+                return path.withCString {
+                    agent_read_prompt_with_transcript(promptPointer, $0) { action, rows in
+                        AgentTerminal.navigate(Int(action), promptRows: Int(rows)) ? 1 : 0
+                    }
+                }
             }
-            return agent_read_prompt(promptPointer, nil)
+            return agent_read_prompt_with_transcript(promptPointer, nil) { action, rows in
+                AgentTerminal.navigate(Int(action), promptRows: Int(rows)) ? 1 : 0
+            }
         }
         guard let input else { return nil }
         defer { free(input) }

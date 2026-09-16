@@ -43,8 +43,7 @@ enum AgentTurn {
                     || interaction.cancellation.isCancelled
                 interaction.tool(call, failed ? "failed" : "completed", result)
             } else {
-                let suffix = result.count > resultLimit ? "..." : ""
-                printColor("   \(result.prefix(resultLimit))\(suffix)\n", color: "yellow")
+                AgentTerminal.toolResult(result, limit: resultLimit)
             }
             return result
         })

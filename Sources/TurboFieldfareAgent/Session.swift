@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import TurboFieldfare
 
 final class AgentSession {
@@ -79,6 +80,8 @@ final class AgentSession {
           Enter a message to ask the agent to work. Enter submits the prompt.
           Shift+Enter inserts a newline (Ctrl+J also works).
           Ctrl+A/Ctrl+E move to the start/end of the current line.
+          Ctrl+O expands/collapses tool responses in place.
+          Page Up/Page Down browse the retained transcript at the prompt.
           Ctrl+C clears the prompt; press again within 3 seconds to exit.
           Up/Down browse history until you edit the prompt, then move between lines.
           Shift+Enter requires a terminal that reports modified Enter keys.
@@ -87,11 +90,21 @@ final class AgentSession {
           ?                    Show this help (press Enter).
           /skills or /         List available slash skills.
           /<skill> [request]   Load a skill and send it with your request.
+          @path                Attach a UTF-8 text file to your prompt.
+          @"path with spaces"  Attach a file with spaces in its name.
           /prompt              Show the current system prompt.
+          /copy                Copy the last assistant response as Markdown.
           /mcp                 Show configured MCP servers.
           /mcp reload          Reload MCP configuration and tool definitions.
           !<command>           Run a shell command; add its output to the conversation.
           /exit or /quit       Exit the agent.
+
+        File references
+          Example: Explain @Sources/TurboFieldfareAgent/Session.swift
+          Paths are relative to the working directory; absolute and ~/ paths work.
+          Up to 16 files, 256 KiB combined. Missing or invalid files stop submission.
+          Separate references with whitespace; punctuation is part of the path.
+          Emails stay literal; prefix an @ mention with a backslash to keep it literal.
 
         Skills
           Slash skills use <skill>.md or <skill>/SKILL.md in:
@@ -116,12 +129,24 @@ final class AgentSession {
 
     func startRepl() async throws {
         runtime.statusLine.start(maxContext: runtime.config.args.maxContext)
-        defer { runtime.statusLine.stop() }
+        AgentTerminal.beginTranscript()
+        defer {
+            AgentTerminal.endTranscript()
+            runtime.statusLine.stop()
+        }
         printColor("\nType ? and press Enter for commands, skills, and built-in tools.\n", color: "gray")
         while let input = readInput() {
             if input == "/exit" || input == "/quit" { break }
             if await handleCommand(input) { continue }
-            guard let prompt = processSlashCommand(userInput: input) else { continue }
+            guard let request = processSlashCommand(userInput: input) else { continue }
+            let prompt: String
+            do {
+                let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+                prompt = request + (try FileReferences.context(in: input, directory: directory))
+            } catch {
+                printColor("\n[Error: \(error)]\n", color: "yellow")
+                continue
+            }
             runtime.remainingToolCalls = 64
             let priorMessageCount = messages.count
             messages.append(GFTokenizer.Message(role: .user, content: prompt, toolCalls: [], toolCallID: nil, name: nil))
@@ -141,11 +166,12 @@ final class AgentSession {
     }
 
     private func readInput() -> String? {
-        print("")
+        terminalPrint("")
         printSeparator()
         runtime.statusLine.preparePrompt()
         let prompt = "\u{01}\u{001B}[32m\u{02}> \u{01}\u{001B}[0m\u{02}"
         guard let input = ReadlineWrapper.read(prompt: prompt) else { return nil }
+        AgentTerminal.recordPrompt(input)
         printSeparator()
         return input
     }
@@ -159,6 +185,8 @@ final class AgentSession {
         case "": break
         case "/prompt":
             printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
+        case "/copy":
+            copyLastResponse()
         case "/mcp reload":
             await reloadMCP()
         case "/mcp":
@@ -168,6 +196,22 @@ final class AgentSession {
         default: return false
         }
         return true
+    }
+
+    private func copyLastResponse() {
+        guard let response = messages.last(where: {
+            $0.role == .assistant && $0.toolCalls.isEmpty && !($0.content ?? "").isEmpty
+        })?.content else {
+            printColor("\n[No assistant response to copy.]\n", color: "yellow")
+            return
+        }
+        let clipboard = NSPasteboard.general
+        clipboard.clearContents()
+        if clipboard.setString(response, forType: .string) {
+            printColor("\n[Last response copied as Markdown.]\n", color: "green")
+        } else {
+            printColor("\n[Could not copy the last response to the clipboard.]\n", color: "yellow")
+        }
     }
 
     private func reloadMCP() async {

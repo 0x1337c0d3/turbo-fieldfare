@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <time.h>
+#include <sys/ioctl.h>
 
 typedef struct {
     const char *prompt;
@@ -13,6 +14,7 @@ typedef struct {
     int edited;
     wchar_t *history_text;
     size_t history_length;
+    agent_transcript_action transcript_action;
 } PromptState;
 
 static PromptState *prompt_state(EditLine *editor) {
@@ -127,6 +129,46 @@ static unsigned char move_to_end(EditLine *editor, int key) {
     return move_to_boundary(editor, 1);
 }
 
+static unsigned char transcript_action(EditLine *editor, int action) {
+    PromptState *state = prompt_state(editor);
+    if (!state->transcript_action) return CC_NORM;
+    struct winsize size;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) != 0 || size.ws_col < 2) return CC_NORM;
+    // The visible prompt is "> ". Reserve its complete wrapped draft, including
+    // lines after the cursor, before asking Swift to repaint the transcript.
+    int rows = 1, column = 2;
+    const LineInfoW *line = el_wline(editor);
+    for (const wchar_t *p = line->buffer; p < line->lastchar; p++) {
+        if (*p == L'\n') { rows++; column = 0; continue; }
+        int width = *p == L'\t' ? 8 - column % 8 : wcwidth(*p);
+        if (width < 0) width = 2;
+        if (column + width > size.ws_col) { rows++; column = 0; }
+        column += width;
+        if (column >= size.ws_col) { rows++; column = 0; }
+    }
+    if (!state->transcript_action(action, rows)) return CC_NORM;
+    // EL_REFRESH forgets the old screen coordinates, but retains the entire
+    // editing buffer and insertion point. CC_REDISPLAY would clear old lines
+    // relative to the *new* origin and erase part of the repainted transcript.
+    el_set(editor, EL_REFRESH);
+    return CC_NORM;
+}
+
+static unsigned char toggle_tools(EditLine *editor, int key) {
+    (void)key;
+    return transcript_action(editor, 0);
+}
+
+static unsigned char transcript_up(EditLine *editor, int key) {
+    (void)key;
+    return transcript_action(editor, -1);
+}
+
+static unsigned char transcript_down(EditLine *editor, int key) {
+    (void)key;
+    return transcript_action(editor, 1);
+}
+
 static void bind_key(EditLine *editor, const char *key, const char *command) {
     el_set(editor, EL_BIND, key, command, NULL);
 }
@@ -141,6 +183,14 @@ static void configure_keys(EditLine *editor) {
     el_set(editor, EL_ADDFN, "agent-end", "End of current line", move_to_end);
     el_set(editor, EL_ADDFN, "agent-cancel", "Clear the prompt", cancel_prompt);
     el_set(editor, EL_ADDFN, "agent-finish-cancel", "Finish clearing the prompt", finish_cancel);
+    el_set(editor, EL_ADDFN, "agent-toggle-tools", "Expand/collapse tool responses", toggle_tools);
+    el_set(editor, EL_ADDFN, "agent-transcript-up", "Previous transcript page", transcript_up);
+    el_set(editor, EL_ADDFN, "agent-transcript-down", "Next transcript page", transcript_down);
+    bind_key(editor, "^O", "agent-toggle-tools");
+    bind_key(editor, "^[[111;5u", "agent-toggle-tools");
+    bind_key(editor, "^[[27;5;111~", "agent-toggle-tools");
+    bind_key(editor, "^[[5~", "agent-transcript-up");
+    bind_key(editor, "^[[6~", "agent-transcript-down");
     bind_key(editor, "^[[95~", "ed-move-to-end");
     bind_key(editor, "^[[96~", "agent-finish-cancel");
     bind_key(editor, "^C", "agent-cancel");
@@ -177,6 +227,8 @@ static void prepare_terminal(EditLine *editor) {
         mode.c_iflag &= ~(ICRNL | INLCR);
         // Handle Ctrl+C on the editor thread; retain other terminal signals.
         mode.c_cc[VINTR] = _POSIX_VDISABLE;
+        // Ctrl+O is a UI command, never the terminal's discard-output toggle.
+        mode.c_cc[VDISCARD] = _POSIX_VDISABLE;
         tcsetattr(STDIN_FILENO, TCSANOW, &mode);
     }
 }
@@ -209,6 +261,11 @@ static char *read_prompt(EditLine *editor, PromptState *state) {
 }
 
 char *agent_read_prompt(const char *prompt, const char *history_path) {
+    return agent_read_prompt_with_transcript(prompt, history_path, NULL);
+}
+
+char *agent_read_prompt_with_transcript(const char *prompt, const char *history_path,
+                                      agent_transcript_action action) {
     EditLine *editor = el_init("TurboFieldfareAgent", stdin, stdout, stderr);
     if (!editor) return NULL;
     History *entries = history_init();
@@ -222,7 +279,7 @@ char *agent_read_prompt(const char *prompt, const char *history_path) {
     el_set(editor, EL_SIGNAL, 1);
     // libedit normally swaps CR/LF. Keep Enter and Ctrl+J distinct.
     el_set(editor, EL_SETTY, "-d", "-icrnl", "-inlcr", NULL);
-    PromptState state = {.prompt = prompt};
+    PromptState state = {.prompt = prompt, .transcript_action = action};
     el_set(editor, EL_CLIENTDATA, &state);
     el_wset(editor, EL_GETCFN, read_character);
     el_set(editor, EL_PROMPT_ESC, prompt_text, '\001');

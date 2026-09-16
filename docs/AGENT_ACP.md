@@ -3,6 +3,8 @@
 `TurboFieldfareAgent --acp` serves Agent Client Protocol v1 over stdin/stdout.
 The terminal REPL remains the default when `--acp` is omitted. The ACP frontend
 and REPL share the model runtime, conversation/tool loop, tools and skill loader.
+For Ctrl-O expansion and transcript navigation in the REPL, see
+[Terminal tool responses](AGENT_TERMINAL.md).
 
 ## Zed setup
 
@@ -157,3 +159,29 @@ was attempted. Zed's live UI and real model tool generation have not been tested
 No model-test protocol was bypassed. Build/test cache access required sandbox
 escalation; the terminated process was only the model-free test runner launched
 for this work.
+
+## REPL file references
+
+In the terminal REPL, attach text files directly with `@path`:
+
+```text
+Explain @Sources/TurboFieldfareAgent/Session.swift
+Compare @README.md @"docs/my notes.md"
+/review Review @Sources/TurboFieldfareAgent/AgentCore.swift
+```
+
+Relative paths use the process working directory. Absolute paths and `~/` paths
+also work. References must start at the beginning of the prompt or after
+whitespace; quote paths containing spaces. Unquoted punctuation belongs to the
+filename. Emails remain literal, and `\@mention` stays literal.
+
+Files are read when the prompt is submitted and included in that user message.
+Repeated paths are included once. Only regular UTF-8 text files without NUL bytes
+are accepted, with at most 16 files and 256 KiB of combined file content per
+prompt. Missing, unreadable, binary, or oversized attachments stop submission
+with an error. File contents and skill bodies are never scanned for additional
+references. These limits bound attachment size; the model's context limit still
+applies to the full conversation.
+
+This syntax is for the terminal REPL. In ACP clients such as Zed, use the client's
+native resource attachments.
