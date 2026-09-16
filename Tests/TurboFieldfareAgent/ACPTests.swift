@@ -195,7 +195,7 @@ final class ACPTests: XCTestCase, @unchecked Sendable {
         let definitions = ToolRegistry.baseDefinitions + [
             GFTokenizer.FunctionDefinition(name: "remote", description: "", parameters: .object([:]))
         ]
-        XCTAssertFalse(ToolRegistry.isMCPTool("code_nav_init", definitions: definitions))
+        XCTAssertFalse(ToolRegistry.isMCPTool("read_file", definitions: definitions))
         XCTAssertFalse(ToolRegistry.isMCPTool("write_file", definitions: definitions))
         XCTAssertFalse(ToolRegistry.isMCPTool("unknown", definitions: definitions))
         XCTAssertTrue(ToolRegistry.isMCPTool("remote", definitions: definitions))

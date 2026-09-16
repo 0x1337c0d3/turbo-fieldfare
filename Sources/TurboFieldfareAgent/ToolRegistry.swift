@@ -40,38 +40,6 @@ struct ToolRegistry {
             ])
         ),
         GFTokenizer.FunctionDefinition(
-            name: "code_nav_init",
-            description: "Initialize tree-sitter AST index",
-            parameters: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "reset": .object(["type": .string("string")])
-                ])
-            ])
-        ),
-        GFTokenizer.FunctionDefinition(
-            name: "code_symbols",
-            description: "List top-level symbols in a file or directory",
-            parameters: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "path": .object(["type": .string("string")])
-                ]),
-                "required": .array([.string("path")])
-            ])
-        ),
-        GFTokenizer.FunctionDefinition(
-            name: "code_query",
-            description: "Query AST using S-expressions",
-            parameters: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "query": .object(["type": .string("string")])
-                ]),
-                "required": .array([.string("query")])
-            ])
-        ),
-        GFTokenizer.FunctionDefinition(
             name: "read_file",
             description: "Reads the contents of a file",
             parameters: .object([
