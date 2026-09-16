@@ -36,6 +36,13 @@ extension ParsedToolCall {
         return value
     }
 
+    func intArgument(_ key: String) -> Int? {
+        guard case .object(let arguments) = arguments else { return nil }
+        if case .integer(let value) = arguments[key] { return Int(value) }
+        if case .number(let value) = arguments[key] { return Int(value) }
+        return nil
+    }
+
     var argumentSummary: String {
         guard case .object(let arguments) = arguments else { return "" }
         let preferred = ["command", "path", "query", "prompt", "url"]

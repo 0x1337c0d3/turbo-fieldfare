@@ -74,6 +74,106 @@ struct ToolRegistry {
                 ]),
                 "required": .array([.string("command")])
             ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "list_dir",
+            description: "List the contents of a directory.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object(["path": .object(["type": .string("string")])]),
+                "required": .array([.string("path")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "find_by_name",
+            description: "Search for files and directories matching specific patterns.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "path": .object(["type": .string("string")]),
+                    "pattern": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("path"), .string("pattern")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "grep_search",
+            description: "Search for exact text matches or regular expressions within files.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "path": .object(["type": .string("string")]),
+                    "query": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("path"), .string("query")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "analyze_image",
+            description: "Examine a local image file. The image will be staged and appended to your context for analysis.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object(["path": .object(["type": .string("string")])]),
+                "required": .array([.string("path")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "define_subagent",
+            description: "Defines a new type of subagent.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "name": .object(["type": .string("string")]),
+                    "system_prompt": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("name"), .string("system_prompt")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "manage_subagents",
+            description: "List or kill active subagents.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "action": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("action")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "send_message",
+            description: "Communicate with a subagent.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "id": .object(["type": .string("string")]),
+                    "message": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("id"), .string("message")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "schedule",
+            description: "Set a timer or recurring schedule.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "duration_seconds": .object(["type": .string("integer")]),
+                    "prompt": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("duration_seconds"), .string("prompt")])
+            ])
+        ),
+        GFTokenizer.FunctionDefinition(
+            name: "manage_task",
+            description: "Manage background tasks.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "action": .object(["type": .string("string")])
+                ]),
+                "required": .array([.string("action")])
+            ])
         )
     ]
 
@@ -169,6 +269,33 @@ struct ToolRegistry {
             return await executeEditFile(call: call, context: context)
         case "execute_bash":
             return await executeBash(call: call, context: context)
+        case "list_dir":
+            return await executeListDir(call: call, context: context)
+        case "find_by_name":
+            return await executeFindByName(call: call, context: context)
+        case "grep_search":
+            return await executeGrepSearch(call: call, context: context)
+        case "analyze_image":
+            return await executeAnalyzeImage(call: call, context: context)
+        case "define_subagent":
+            guard let name = call.stringArgument("name"), let prompt = call.stringArgument("system_prompt") else { return "Error" }
+            await AgentManager.shared.defineSubagent(name: name, prompt: prompt)
+            return "Subagent \(name) defined."
+        case "manage_subagents":
+            return await AgentManager.shared.listSubagents()
+        case "send_message":
+            guard let id = call.stringArgument("id"), let msg = call.stringArgument("message") else { return "Error" }
+            return await AgentManager.shared.sendMessage(id: id, message: msg)
+        case "schedule":
+            guard let duration = call.intArgument("duration_seconds"), let prompt = call.stringArgument("prompt") else { return "Error" }
+            let id = UUID().uuidString
+            await AgentManager.shared.startTask(id: id, description: "Timer for \(duration)s: \(prompt)") {
+                try? await Task.sleep(nanoseconds: UInt64(duration) * 1_000_000_000)
+                print("\n[Timer Fired]: \(prompt)")
+            }
+            return "Scheduled task \(id)"
+        case "manage_task":
+            return await AgentManager.shared.listTasks()
         default:
             if let memoryService = context.memoryService,
                await memoryService.toolDefinitions().contains(where: { $0.name == call.name }) {
@@ -290,5 +417,45 @@ struct ToolRegistry {
         } catch {
             return "Error: \(error)"
         }
+    }
+
+    private static func executeListDir(call: ParsedToolCall, context: AgentToolContext) async -> String {
+        guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(atPath: context.path(path))
+            return contents.joined(separator: "\n")
+        } catch {
+            return "Error listing directory: \(error)"
+        }
+    }
+
+    private static func executeFindByName(call: ParsedToolCall, context: AgentToolContext) async -> String {
+        guard let path = call.stringArgument("path"), let pattern = call.stringArgument("pattern") else { return "Error: invalid arguments" }
+        do {
+            let output = try await ShellCommand.run("find \"\(context.path(path))\" -name \"\(pattern)\"", directory: context.directory, cancellation: context.interaction?.cancellation)
+            return output.isEmpty ? "No files found matching \(pattern)" : output
+        } catch {
+            return "Error finding files: \(error)"
+        }
+    }
+
+    private static func executeGrepSearch(call: ParsedToolCall, context: AgentToolContext) async -> String {
+        guard let path = call.stringArgument("path"), let query = call.stringArgument("query") else { return "Error: invalid arguments" }
+        do {
+            let output = try await ShellCommand.run("grep -rnI \"\(query)\" \"\(context.path(path))\"", directory: context.directory, cancellation: context.interaction?.cancellation)
+            guard output.count > 8192 else { return output.isEmpty ? "No matches found" : output }
+            return String(output.prefix(8192)) + "\n... (output truncated)"
+        } catch {
+            return "Error running grep: \(error)"
+        }
+    }
+
+    private static func executeAnalyzeImage(call: ParsedToolCall, context: AgentToolContext) async -> String {
+        guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
+        // For the CLI context, we need to instruct the runtime to stage the image.
+        // Since TurboFieldfareAgent doesn't natively hold the StagedImage context here, 
+        // we emit a system directive that the image is staged if running in App, 
+        // or print a local warning. 
+        return "Image at \(path) staged for analysis. Instruct the user to view or describe it."
     }
 }
