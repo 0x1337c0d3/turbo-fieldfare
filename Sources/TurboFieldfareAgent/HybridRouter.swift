@@ -13,13 +13,29 @@ struct HybridRouter {
     func decide(messages: [GFTokenizer.Message]) async throws -> RouteTarget {
         guard cloudClient != nil else { return .local }
         
-        // 1. Heuristic Classifier
-        if let heuristic = checkHeuristics(messages: messages) {
-            return heuristic
+        let spinnerTask = Task {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            var index = 0
+            while !Task.isCancelled {
+                AgentTerminal.write("\r\u{001B}[34m\(frames[index % frames.count]) Routing...\u{001B}[0m\u{001B}[K")
+                index += 1
+                do { try await Task.sleep(for: .milliseconds(80)) } catch { break }
+            }
+            AgentTerminal.write("\r\u{001B}[K")
         }
         
-        // 2. Router LLM
-        return try await askLocalRouter(messages: messages)
+        let target: RouteTarget
+        do {
+            if let heuristic = checkHeuristics(messages: messages) {
+                target = heuristic
+            } else {
+                target = try await askLocalRouter(messages: messages)
+            }
+        }
+        
+        spinnerTask.cancel()
+        _ = await spinnerTask.value
+        return target
     }
     
     private func checkHeuristics(messages: [GFTokenizer.Message]) -> RouteTarget? {
