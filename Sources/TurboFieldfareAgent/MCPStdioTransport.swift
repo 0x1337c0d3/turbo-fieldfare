@@ -1,145 +1,150 @@
 import Foundation
 import TurboFieldfare
 
+/// All process/RPC state is confined to queue. Cancellation tokens are locked.
 final class MCPStdioTransport: MCPServerTransport, @unchecked Sendable {
-    let process: Process
-    let inPipe = Pipe()
-    let outPipe = Pipe()
-    var requestId = 1
     let name: String
-    let queue = DispatchQueue(label: "mcp.server.queue")
+    let connectionDetails: String
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private let queue = DispatchQueue(label: "agent.mcp.stdio")
+    private var requestID = 0
+    private var initialized = false
+    private var buffer = Data()
 
-    var connectionDetails: String {
-        let path = process.executableURL?.path ?? "unknown"
-        let args = process.arguments?.joined(separator: " ") ?? ""
-        return "\(path) \(args)"
-    }
-
-    init(name: String, command: String, args: [String], env: [String: String]?) throws {
+    init(name: String, command: String, args: [String], env: [String: String]?, directory: URL? = nil) throws {
         self.name = name
-        process = Process()
-
-        var executablePath = command
-        if executablePath.hasPrefix("~") {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            executablePath = (home as NSString).appendingPathComponent(String(executablePath.dropFirst(2)))
-        }
-
-        if !executablePath.contains("/") {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = [executablePath] + args
-        } else {
-            process.executableURL = URL(fileURLWithPath: executablePath)
+        self.connectionDetails = ([command] + args).joined(separator: " ")
+        let expanded = (command as NSString).expandingTildeInPath
+        if expanded.contains("/") {
+            process.executableURL = URL(fileURLWithPath: expanded, relativeTo: directory).standardizedFileURL
             process.arguments = args
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [expanded] + args
         }
-
-        if let env = env {
-            var currentEnv = ProcessInfo.processInfo.environment
-            for (k, v) in env { currentEnv[k] = v }
-            process.environment = currentEnv
-        }
-
-        process.standardInput = inPipe
-        process.standardOutput = outPipe
-
+        process.currentDirectoryURL = directory
+        process.environment = ProcessInfo.processInfo.environment.merging(env ?? [:]) { _, value in value }
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.standardError
         try process.run()
-
-        let initReq = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"turbo-agent\",\"version\":\"1.0.0\"}}}\n"
-        inPipe.fileHandleForWriting.write(initReq.data(using: .utf8)!)
-        _ = readLineSync()
-
-        let initNotif = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
-        inPipe.fileHandleForWriting.write(initNotif.data(using: .utf8)!)
+        try? input.fileHandleForReading.close()
+        try? output.fileHandleForWriting.close()
+        ProcessIO.nonblocking(input.fileHandleForWriting)
+        ProcessIO.nonblocking(output.fileHandleForReading)
+        // Broken pipes must become transport errors, not terminate the agent.
+        signal(SIGPIPE, SIG_IGN)
     }
 
-    deinit {
-        process.terminate()
+    deinit { ProcessIO.stop(process) }
+
+    private func send(_ object: [String: Any], token: AgentCancellation, deadline: ContinuousClock.Instant) throws {
+        var bytes = try JSONSerialization.data(withJSONObject: object)
+        bytes.append(10)
+        try ProcessIO.write(bytes, to: input.fileHandleForWriting, cancellation: token, deadline: deadline)
     }
 
-    func readLineSync() -> String {
-        var data = Data()
-        let handle = outPipe.fileHandleForReading
+    private func line(token: AgentCancellation, deadline: ContinuousClock.Instant) throws -> Data {
         while true {
-            let byte = handle.readData(ofLength: 1)
-            if byte.isEmpty { break }
-            if byte == Data([10]) { break }
-            data.append(byte)
+            if let newline = buffer.firstIndex(of: 10) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                return line
+            }
+            guard let bytes = try ProcessIO.read(from: output.fileHandleForReading, cancellation: token, deadline: deadline) else {
+                throw ACPError.disconnected
+            }
+            buffer.append(bytes)
+            guard buffer.count <= 8 * 1024 * 1024 else { throw ACPError.invalid("MCP response too large") }
         }
-        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func rpc(_ method: String, params: [String: Any], token: AgentCancellation) throws -> [String: Any] {
+        try token.check()
+        guard process.isRunning else { throw ACPError.disconnected }
+        requestID += 1
+        let id = requestID
+        let deadline = ContinuousClock.now.advanced(by: .seconds(60))
+        try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params], token: token, deadline: deadline)
+        while true {
+            let data = try line(token: token, deadline: deadline)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if object["method"] != nil {
+                // This agent does not implement MCP sampling/elicitation requests.
+                if let incomingID = object["id"] {
+                    try send(["jsonrpc": "2.0", "id": incomingID,
+                              "error": ["code": -32601, "message": "Method not supported"]], token: token, deadline: deadline)
+                }
+                continue
+            }
+            guard MCPRPC.matches(String(decoding: data, as: UTF8.self), id: id) else { continue }
+            guard object["error"] == nil, let result = object["result"] as? [String: Any] else {
+                throw ACPError(code: -32000, message: "MCP request failed")
+            }
+            return result
+        }
+    }
+
+    private func initialize(token: AgentCancellation) throws {
+        guard !initialized else { return }
+        let result = try rpc("initialize", params: [
+            "protocolVersion": "2025-03-26", "capabilities": [:] as [String: String],
+            "clientInfo": ["name": "TurboFieldfareAgent", "version": "1.0.0"]
+        ], token: token)
+        guard let version = result["protocolVersion"] as? String,
+              ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"].contains(version) else {
+            throw ACPError.invalid("Unsupported MCP version")
+        }
+        try send(["jsonrpc": "2.0", "method": "notifications/initialized"], token: token,
+                 deadline: ContinuousClock.now.advanced(by: .seconds(60)))
+        initialized = true
+    }
+
+    private func perform<T: Sendable>(_ operation: @escaping @Sendable (AgentCancellation) throws -> T) async throws -> T {
+        let token = AgentCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    do {
+                        try self.initialize(token: token)
+                        continuation.resume(returning: try operation(token))
+                    } catch {
+                        // A cancelled/timed-out stream has ambiguous response state.
+                        ProcessIO.stop(self.process)
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: { token.cancel() }
     }
 
     func listTools() async -> [GFTokenizer.FunctionDefinition] {
-        return await withCheckedContinuation { cont in
-            queue.async {
-                let reqId = self.requestId
-                self.requestId += 1
-                let req = "{\"jsonrpc\":\"2.0\",\"id\":\(reqId),\"method\":\"tools/list\"}\n"
-                self.inPipe.fileHandleForWriting.write(req.data(using: .utf8)!)
-
-                while true {
-                    let line = self.readLineSync()
-                    if line.isEmpty { break }
-                    if MCPRPC.matches(line, id: reqId) {
-                        if let data = line.data(using: .utf8),
-                           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let result = dict["result"] as? [String: Any],
-                           let tools = result["tools"] as? [[String: Any]] {
-                            let defs = tools.compactMap { tool -> GFTokenizer.FunctionDefinition? in
-                                guard tool["description"] is String else { return nil }
-                                return try? MCPToolDefinition.decode(tool)
-                            }
-                            cont.resume(returning: defs)
-                            return
-                        }
-                        break
-                    }
-                }
-                cont.resume(returning: [])
+        do {
+            return try await perform { token in
+                var tools: [GFTokenizer.FunctionDefinition] = []
+                var cursor: String?
+                var seen = Set<String>()
+                repeat {
+                    let result = try self.rpc("tools/list", params: cursor.map { ["cursor": $0] } ?? [:], token: token)
+                    tools += try (result["tools"] as? [[String: Any]] ?? []).compactMap(MCPToolDefinition.decode)
+                    cursor = result["nextCursor"] as? String
+                    if let cursor, !seen.insert(cursor).inserted { throw ACPError.invalid("Repeated MCP cursor") }
+                } while cursor != nil
+                return tools
             }
-        }
+        } catch { return [] }
     }
 
     func callTool(name: String, argsJson: String) async -> String {
-        return await withCheckedContinuation { cont in
-            queue.async {
-                let reqId = self.requestId
-                self.requestId += 1
-
-                guard let request = try? MCPRPC.call(id: reqId, name: name, argumentsJSON: argsJson) else {
-                    cont.resume(returning: "Error: invalid MCP arguments")
-                    return
-                }
-                self.inPipe.fileHandleForWriting.write(request)
-
-                while true {
-                    let line = self.readLineSync()
-                    if line.isEmpty { break }
-                    if MCPRPC.matches(line, id: reqId) {
-                        if let data = line.data(using: .utf8),
-                           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                            if let error = dict["error"] as? [String: Any] {
-                                let msg = error["message"] as? String ?? "Unknown"
-                                let code = error["code"] as? Int
-                                if code == -32601 || msg.lowercased().contains("not found") {
-                                    cont.resume(returning: "TOOL_NOT_FOUND")
-                                    return
-                                }
-                                cont.resume(returning: "Error: \(msg)")
-                                return
-                            }
-                            if let result = dict["result"] as? [String: Any],
-                               let content = result["content"] as? [[String: Any]],
-                               let text = content.first?["text"] as? String {
-                                cont.resume(returning: text)
-                                return
-                            }
-                        }
-                        cont.resume(returning: "Failed to parse result from MCP: \(line)")
-                        return
-                    }
-                }
-                cont.resume(returning: "TOOL_NOT_FOUND")
+        do {
+            return try await perform { token in
+                let arguments = try JSONSerialization.jsonObject(with: Data(argsJson.utf8))
+                let result = try self.rpc("tools/call", params: ["name": name, "arguments": arguments], token: token)
+                let text = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n")
+                return result["isError"] as? Bool == true ? "Error: \(text)" : text
             }
-        }
+        } catch { return "Error: MCP request failed or was cancelled" }
     }
 }

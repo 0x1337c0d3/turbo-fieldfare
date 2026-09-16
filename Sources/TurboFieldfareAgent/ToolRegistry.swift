@@ -142,55 +142,63 @@ struct ToolRegistry {
         mcpTools = newMcpTools
     }
 
-    static func execute(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
+    static func isMCPTool(_ name: String, definitions: [GFTokenizer.FunctionDefinition]) -> Bool {
+        !baseDefinitions.contains(where: { $0.name == name })
+            && definitions.contains(where: { $0.name == name })
+    }
+
+    static func execute(call: ParsedToolCall, runtime: AgentRuntime,
+                        context suppliedContext: AgentToolContext? = nil) async -> String {
+        let context = suppliedContext ?? .terminal(runtime)
+        if context.interaction?.cancellation.isCancelled == true || Task.isCancelled { return "Error: cancelled" }
         guard runtime.remainingToolCalls > 0 else { return "Error: tool-call budget exhausted for this user turn" }
         runtime.remainingToolCalls -= 1
-        guard call.name == "invoke_subagent" || ToolApproval.request(call) else {
+        let approved: Bool
+        if call.name == "invoke_subagent" { approved = true }
+        else if let interaction = context.interaction { approved = await interaction.approve(call) }
+        else { approved = ToolApproval.request(call) }
+        guard approved else {
             return "Tool call denied by the user or unavailable in non-interactive mode. Do not retry without a new user request."
         }
+        if context.interaction?.cancellation.isCancelled == true || Task.isCancelled { return "Error: cancelled" }
+        context.interaction?.tool(call, "in_progress", nil)
         switch call.name {
         case "invoke_subagent":
-            return await executeInvokeSubagent(call: call, runtime: runtime)
+            return await executeInvokeSubagent(call: call, runtime: runtime, context: context)
         case "read_url":
             return await executeReadURL(call: call)
         case "read_file":
-            return executeReadFile(call: call)
+            return await executeReadFile(call: call, context: context)
         case "write_file":
-            return executeWriteFile(call: call)
+            return await executeWriteFile(call: call, context: context)
         case "edit_file":
-            return executeEditFile(call: call)
+            return await executeEditFile(call: call, context: context)
         case "execute_bash":
-            return executeBash(call: call)
+            return await executeBash(call: call, context: context)
         default:
-            if mcpTools.contains(call.name) {
-                return await executeMCP(call: call)
+            if isMCPTool(call.name, definitions: context.definitions) {
+                return await executeMCP(call: call, mcp: context.mcp)
             }
             return "Error: unknown tool"
         }
     }
 
-    private static func executeInvokeSubagent(call: ParsedToolCall, runtime: AgentRuntime) async -> String {
+    private static func executeInvokeSubagent(call: ParsedToolCall, runtime: AgentRuntime,
+                                             context: AgentToolContext) async -> String {
         guard runtime.subagentDepth < 4 else { return "Error: subagent nesting limit reached" }
         runtime.subagentDepth += 1
         defer { runtime.subagentDepth -= 1 }
-        let promptStr = call.stringArgument("prompt") ?? ""
-
-        printColor("\n--- [Subagent Started] ---\n", color: "blue")
-        let subSession = AgentSession(runtime: runtime)
-        subSession.messages[0] = GFTokenizer.Message(role: .system, content: runtime.config.systemPrompt + "\n\nYou are a SUBAGENT working on a delegated task. Return the final result clearly.", toolCalls: [], toolCallID: nil, name: nil)
-        subSession.messages.append(GFTokenizer.Message(role: .user, content: promptStr, toolCalls: [], toolCallID: nil, name: nil))
-
+        var messages = [
+            GFTokenizer.Message(role: .system, content: context.systemPrompt + "\nYou are a delegated subagent. Return your result clearly.", toolCalls: [], toolCallID: nil, name: nil),
+            GFTokenizer.Message(role: .user, content: call.stringArgument("prompt") ?? "", toolCalls: [], toolCallID: nil, name: nil)
+        ]
         do {
-            let result = try await subSession.completeTurn(resultLimit: 200)
-            printColor("\n--- [Subagent Finished] ---\n", color: "blue")
-            return result.isEmpty ? "No output from subagent." : result
-        } catch {
-            return "Subagent Error: \(error)"
-        }
+            return try await AgentTurn.run(runtime: runtime, messages: &messages, context: context, resultLimit: 200)
+        } catch { return "Error: subagent failed: \(error)" }
     }
 
-    private static func executeMCP(call: ParsedToolCall) async -> String {
-        guard let mcp = MCPClient.shared else { return "Error: MCP Client not initialized" }
+    private static func executeMCP(call: ParsedToolCall, mcp: MCPClient?) async -> String {
+        guard let mcp else { return "Error: MCP Client not initialized" }
         guard let argsData = try? JSONEncoder().encode(call.arguments),
               let argsJson = String(data: argsData, encoding: .utf8) else {
             return "Error: invalid MCP arguments"
@@ -216,47 +224,58 @@ struct ToolRegistry {
         }
     }
 
-    private static func executeReadFile(call: ParsedToolCall) -> String {
+    private static func executeReadFile(call: ParsedToolCall, context: AgentToolContext) async -> String {
         guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
         do {
-            return try String(contentsOfFile: path, encoding: .utf8)
+            return try await readFile(context.path(path), context: context)
         } catch {
             return "Error reading file: \(error)"
         }
     }
 
-    private static func executeWriteFile(call: ParsedToolCall) -> String {
+    private static func executeWriteFile(call: ParsedToolCall, context: AgentToolContext) async -> String {
         guard let path = call.stringArgument("path"),
               let content = call.stringArgument("content") else { return "Error: invalid arguments" }
         do {
-            try content.write(toFile: path, atomically: true, encoding: .utf8)
+            try await writeFile(context.path(path), content: content, context: context)
             return "Successfully wrote to \(path)"
         } catch {
             return "Error writing file: \(error)"
         }
     }
 
-    private static func executeEditFile(call: ParsedToolCall) -> String {
+    private static func executeEditFile(call: ParsedToolCall, context: AgentToolContext) async -> String {
         guard let path = call.stringArgument("path"),
               let target = call.stringArgument("target"),
               let replacement = call.stringArgument("replacement") else {
             return "Error: invalid arguments. Received: \(call.arguments)"
         }
         do {
-            let content = try String(contentsOfFile: path, encoding: .utf8)
+            let content = try await readFile(context.path(path), context: context)
             guard content.contains(target) else { return "Error: target string not found in file" }
             let updated = content.replacingOccurrences(of: target, with: replacement)
-            try updated.write(toFile: path, atomically: true, encoding: .utf8)
+            try await writeFile(context.path(path), content: updated, context: context)
             return "Successfully updated \(path)"
         } catch {
             return "Error editing file: \(error)"
         }
     }
 
-    private static func executeBash(call: ParsedToolCall) -> String {
+    private static func readFile(_ path: String, context: AgentToolContext) async throws -> String {
+        if let read = context.interaction?.readFile { return try await read(path) }
+        return try String(contentsOfFile: path, encoding: .utf8)
+    }
+
+    private static func writeFile(_ path: String, content: String, context: AgentToolContext) async throws {
+        try context.interaction?.cancellation.check()
+        if let write = context.interaction?.writeFile { try await write(path, content); return }
+        try content.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    private static func executeBash(call: ParsedToolCall, context: AgentToolContext) async -> String {
         guard let command = call.stringArgument("command") else { return "Error: invalid arguments" }
         do {
-            let output = try ShellCommand.run(command)
+            let output = try await ShellCommand.run(command, directory: context.directory, cancellation: context.interaction?.cancellation)
             guard output.count > 8192 else { return output }
             return String(output.prefix(8192))
                 + "\n... (output truncated: too large for context window. please use grep, head, or tail to narrow it down)"

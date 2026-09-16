@@ -2,6 +2,15 @@ import Foundation
 
 /// Discovers entry points without reading skill bodies or reference documents.
 enum SkillLibrary {
+    static func expand(_ text: String, skills: [String: URL]) throws -> String {
+        guard text.hasPrefix("/") else { return text }
+        let parts = text.dropFirst().split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+        guard let name = parts.first.map(String.init), let file = skills[name] else { return text }
+        let body = try String(contentsOf: file, encoding: .utf8)
+        let request = parts.count > 1 ? String(parts[1]) : ""
+        return "[Skill: \(name), source: \(file.path)]\n\(body)\n\nUser Request:\n\(request)"
+    }
+
     static func discover(roots: [URL]) -> [String: URL] {
         let fm = FileManager.default
         var skills: [String: URL] = [:]

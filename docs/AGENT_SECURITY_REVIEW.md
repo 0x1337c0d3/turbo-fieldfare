@@ -76,3 +76,25 @@ Environment: commit `0ca5e8f` plus working-tree changes; Apple M2 Pro, 32 GB RAM
 macOS 26.6.2; Swift 6.4. Tests used local tokenizer files and fake network
 credentials. No benchmark or model-process protocol was invoked. Swift cache
 access required sandbox escalation. `git diff --check` passed.
+
+## ACP implementation follow-up
+
+The ACP integration adds a UI approval path with explicit allow-once selection;
+missing, failed, unknown and cancelled choices deny execution. Client file access
+is capability-gated. Session-specific MCP catalogs retain the reserved-name
+checks, and stdout is reserved for framed protocol messages.
+
+Parts of AGENT-007 are addressed for model-invoked tools: shell and stdio MCP
+operations now have cancellation-aware I/O, bounded buffers and monotonic
+deadlines. Stdio cancellation stops the owned subprocess. Direct REPL `!command`
+execution and file/HTTP response buffering still need the separate resource-limit
+review described above. Detached shell descendants are not covered by process
+group cancellation.
+
+The generation presentation was extracted into `TerminalGeneration`, with locked
+spinner/input state and terminal restoration before its forced-exit path. ACP
+uses synchronized cancellation and never reads keyboard input during generation.
+This narrows AGENT-008; it does not constitute a fresh full concurrency audit.
+
+See [ACP setup and validation](AGENT_ACP.md) for protocol tests, supported behavior
+and the live-model validation limitation.

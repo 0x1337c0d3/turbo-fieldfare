@@ -18,7 +18,7 @@ final class MCPClient: @unchecked Sendable {
     var servers: [MCPServerTransport] = []
     private var toolServers: [String: MCPServerTransport] = [:]
 
-    init?() {
+    convenience init?() {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
         let configDir = homeDir.appendingPathComponent(".config/TurboFieldfareAgent")
         let configURL = configDir.appendingPathComponent("settings.json")
@@ -53,7 +53,20 @@ final class MCPClient: @unchecked Sendable {
             return nil
         }
 
-        for (name, serverConfig) in mcpServers {
+        self.init(configurations: mcpServers, directory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+        if servers.isEmpty { return nil }
+    }
+
+    static func localConfigurations() -> [String: AgentMCPConfig.ServerConfig] {
+        let file = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/TurboFieldfareAgent/settings.json")
+        guard let data = try? Data(contentsOf: file),
+              let config = try? JSONDecoder().decode(AgentMCPConfig.self, from: data) else { return [:] }
+        return config.mcpServers ?? [:]
+    }
+
+    init(configurations: [String: AgentMCPConfig.ServerConfig], directory: URL) {
+        for (name, serverConfig) in configurations.sorted(by: { $0.key < $1.key }) {
             if serverConfig.type == "sse" {
                 printColor("Skipping MCP server \(name): legacy SSE is no longer supported. Use a Streamable HTTP endpoint with type 'http' or omit type.\n", color: "yellow")
                 continue
@@ -78,7 +91,7 @@ final class MCPClient: @unchecked Sendable {
                 }
             } else if let command = serverConfig.command {
                 do {
-                    let server = try MCPStdioTransport(name: name, command: command, args: serverConfig.args ?? [], env: serverConfig.env)
+                    let server = try MCPStdioTransport(name: name, command: command, args: serverConfig.args ?? [], env: serverConfig.env, directory: directory)
                     servers.append(server)
                 } catch {
                     printColor("Failed to start MCP server \(name): \(error)" + "\n", color: "yellow")
@@ -86,10 +99,6 @@ final class MCPClient: @unchecked Sendable {
             }
         }
 
-        if servers.isEmpty {
-            printColor("No valid MCP servers configured or started." + "\n", color: "yellow")
-            return nil
-        }
     }
 
     func listAllTools() async -> [GFTokenizer.FunctionDefinition] {

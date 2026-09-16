@@ -1,7 +1,7 @@
 import Foundation
 import TurboFieldfareCLICore
 
-struct AgentConfig {
+struct AgentConfig: Sendable {
     let args: Args
     let systemPrompt: String
 
@@ -59,8 +59,7 @@ struct AgentConfig {
             print(Args.usage)
             exit(0)
         } catch {
-            print("error: \(error)")
-            exit(2)
+            throw error
         }
 
         return (parsedArgs, agentsFilePath, systemPromptPath)
@@ -130,8 +129,8 @@ struct AgentConfig {
 }
 
 // MCP settings use JSON; environment header values are variable names, not templates.
-struct AgentMCPConfig: Decodable {
-    struct ServerConfig: Decodable {
+struct AgentMCPConfig: Decodable, Sendable {
+    struct ServerConfig: Decodable, Sendable {
         let command: String?
         let args: [String]?
         let env: [String: String]?

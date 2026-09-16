@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#try-it">Quick start</a> ·
   <a href="docs/OPENAI_SERVER.md">Local server</a> ·
+  <a href="docs/AGENT_ACP.md">Agent in Zed / ACP</a> ·
   <a href="docs/BENCHMARKS.md">Benchmarks</a> ·
   <a href="docs/COMMUNITY_BENCHMARKS.md">Contribute results</a> ·
   <a href="docs/SYSTEM_DESIGN.md">How it works</a> ·

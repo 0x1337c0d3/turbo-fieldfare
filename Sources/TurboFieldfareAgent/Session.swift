@@ -136,16 +136,8 @@ final class AgentSession {
     }
 
     func completeTurn(resultLimit: Int = 300) async throws -> String {
-        try await ConversationTurn.run(
-            messages: &messages,
-            generate: { [runtime] in try await runtime.generate(messages: $0) },
-            execute: { [runtime] call in
-                printColor("\n● \(call.name)(\(call.argumentSummary))\n", color: "green")
-                let result = await ToolRegistry.execute(call: call, runtime: runtime)
-                let suffix = result.count > resultLimit ? "..." : ""
-                printColor("   \(result.prefix(resultLimit))\(suffix)\n", color: "yellow")
-                return result
-            })
+        try await AgentTurn.run(runtime: runtime, messages: &messages,
+                                context: .terminal(runtime), resultLimit: resultLimit)
     }
 
     private func readInput() -> String? {

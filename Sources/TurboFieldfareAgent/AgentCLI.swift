@@ -91,6 +91,16 @@ struct ReadlineWrapper {
 @main
 struct AgentCLI {
     static func main() async throws {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.contains("--help") || arguments.contains("-h") {
+            print("TurboFieldfareAgent: use --acp for ACP over stdio; omit it for the terminal REPL.\n")
+            print(Args.usage)
+            return
+        }
+        if arguments.contains("--acp") {
+            try await ACPServer.run(arguments: arguments.filter { $0 != "--acp" })
+            return
+        }
         let config = try AgentConfig()
         let runtime = try await AgentRuntime(config: config)
         await ToolRegistry.reloadMCPTools()
