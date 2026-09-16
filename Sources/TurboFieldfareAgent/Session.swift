@@ -94,6 +94,8 @@ final class AgentSession {
           @"path with spaces"  Attach a file with spaces in its name.
           /prompt              Show the current system prompt.
           /copy                Copy the last assistant response as Markdown.
+          /compact             Summarize and compress the conversation history.
+          /clear or /new       Reset the context window to start fresh.
           /mcp                 Show configured MCP servers.
           /mcp reload          Reload MCP configuration and tool definitions.
           !<command>           Run a shell command; add its output to the conversation.
@@ -187,15 +189,45 @@ final class AgentSession {
             printColor("\n[System Prompt]:\n\(runtime.config.systemPrompt)\n", color: "gray")
         case "/copy":
             copyLastResponse()
+        case "/compact":
+            await compactHistory()
         case "/mcp reload":
             await reloadMCP()
         case "/mcp":
             printMCPServers()
+        case "/clear", "/new":
+            messages = [messages[0]]
+            printColor("\n[Context cleared. Starting fresh.]\n", color: "green")
         case _ where input.hasPrefix("!"):
             handleShellCommand(userInput: input)
         default: return false
         }
         return true
+    }
+
+    private func compactHistory() async {
+        guard messages.count > 1 else {
+            printColor("\n[History is already empty or only contains the system prompt.]\n", color: "yellow")
+            return
+        }
+        
+        printColor("\n[Compacting history...]\n", color: "blue")
+        let originalMessages = messages
+        
+        messages.append(GFTokenizer.Message(role: .user, content: "Summarize the work done so far, noting any current objectives and dead-ends.", toolCalls: [], toolCallID: nil, name: nil))
+        
+        do {
+            runtime.remainingToolCalls = 64
+            let summary = try await completeTurn()
+            messages = [
+                originalMessages[0],
+                GFTokenizer.Message(role: .user, content: "Summary of previous work:\n\(summary)", toolCalls: [], toolCallID: nil, name: nil)
+            ]
+            printColor("\n[History compacted successfully.]\n", color: "green")
+        } catch {
+            printColor("\n[Error compacting history: \(error)]\n", color: "red")
+            messages = originalMessages
+        }
     }
 
     private func copyLastResponse() {
