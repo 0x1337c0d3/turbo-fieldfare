@@ -1,83 +1,20 @@
 import Foundation
 import TurboFieldfare
 
+#if canImport(FoundationModels)
+  import FoundationModels
+#endif
+
 public enum AppleFoundationModelError: Error, CustomStringConvertible {
   case unsupportedPlatform(String)
+  case modelUnavailable(String)
+  case generationFailed(String)
 
   public var description: String {
     switch self {
     case .unsupportedPlatform(let msg): return msg
-    }
-  }
-}
-
-public enum FoundationModels {
-  public struct DynamicFunction: @unchecked Sendable {
-    public let name: String
-    public let description: String
-    public let parametersSchema: [String: Any]
-
-    public init(name: String, description: String, parametersSchema: [String: Any]) {
-      self.name = name
-      self.description = description
-      self.parametersSchema = parametersSchema
-    }
-  }
-
-  public struct DynamicFunctionInvocation: Sendable {
-    public let id: String
-    public let name: String
-    public let argumentsJSONString: String
-
-    public init(id: String, name: String, argumentsJSONString: String) {
-      self.id = id
-      self.name = name
-      self.argumentsJSONString = argumentsJSONString
-    }
-  }
-
-  public enum ChatMessage: Sendable {
-    case user(String)
-    case assistant(String)
-    case toolResponse(id: String, content: String)
-  }
-
-  public struct ModelConfiguration: Sendable {
-    public enum CloudOffloadPolicy: Sendable {
-      case opportunisticPrivateCloudCompute
-      case disabled
-      case requirePrivateCloudCompute
-    }
-
-    public var cloudOffloadPolicy: CloudOffloadPolicy = .opportunisticPrivateCloudCompute
-
-    public init(configure: (inout ModelConfiguration) -> Void) {
-      configure(&self)
-    }
-  }
-
-  public enum StreamChunk: Sendable {
-    case textDelta(String)
-    case thoughtDelta(String)
-    case toolCall(DynamicFunctionInvocation)
-  }
-
-  public final class LanguageModelSession: @unchecked Sendable {
-    public let configuration: ModelConfiguration
-    public let instructions: String
-
-    public init(configuration: ModelConfiguration, instructions: String) throws {
-      self.configuration = configuration
-      self.instructions = instructions
-    }
-
-    public func stream(
-      _ turns: [ChatMessage],
-      tools: [DynamicFunction] = []
-    ) -> AsyncThrowingStream<StreamChunk, Error> {
-      return AsyncThrowingStream { continuation in
-        continuation.finish()
-      }
+    case .modelUnavailable(let msg): return msg
+    case .generationFailed(let msg): return msg
     }
   }
 }
@@ -107,56 +44,112 @@ final class AppleFoundationModelBackend: InferenceBackend, @unchecked Sendable {
     tools: [GFTokenizer.FunctionDefinition]?,
     interaction: AgentInteraction?
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
-    guard #available(macOS 27.0, *) else {
-      throw AppleFoundationModelError.unsupportedPlatform(
-        "Apple Foundation Models require macOS 27.0 (Golden Gate) or later."
+    #if canImport(FoundationModels)
+      guard #available(macOS 27.0, *) else {
+        throw AppleFoundationModelError.unsupportedPlatform(
+          "Apple Foundation Models require macOS 27.0 (Golden Gate) or later."
+        )
+      }
+
+      return try await generateWithFoundationModels(
+        messages: messages,
+        tools: tools,
+        interaction: interaction
       )
-    }
-
-    let configuration = FoundationModels.ModelConfiguration { config in
-      switch pccPolicy {
-      case .auto:
-        config.cloudOffloadPolicy = .opportunisticPrivateCloudCompute
-      case .disable:
-        config.cloudOffloadPolicy = .disabled  // AFM 3 Core (On-Device ANE/GPU) only
-      case .require:
-        config.cloudOffloadPolicy = .requirePrivateCloudCompute  // AFM Cloud Pro via PCC
-      }
-    }
-
-    let session = try FoundationModels.LanguageModelSession(
-      configuration: configuration,
-      instructions: systemPrompt
-    )
-
-    // Translate tool definitions via MCPJSONSchemaBridge
-    let dynamicFunctions = (tools ?? []).map { toolBridge.bridge(definition: $0) }
-
-    // Convert TurboFieldfare messages to FoundationModels conversation history
-    let turns = toolBridge.convertMessages(messages)
-
-    var fullText = ""
-    var parsedCalls: [ParsedToolCall] = []
-
-    let stream = session.stream(turns, tools: dynamicFunctions)
-    for try await chunk in stream {
-      if let interaction, interaction.cancellation.isCancelled {
-        throw CancellationError()
-      }
-      switch chunk {
-      case .textDelta(let delta):
-        fullText += delta
-        interaction?.text(delta)
-      case .thoughtDelta(let thought):
-        if interaction == nil {
-          printColor(thought, color: "gray")
-        }
-      case .toolCall(let invocation):
-        let call = toolBridge.decodeCall(invocation: invocation)
-        parsedCalls.append(call)
-      }
-    }
-
-    return (fullText, parsedCalls)
+    #else
+      throw AppleFoundationModelError.unsupportedPlatform(
+        "FoundationModels framework is not available in this build."
+      )
+    #endif
   }
+
+  #if canImport(FoundationModels)
+    @available(macOS 27.0, *)
+    private func generateWithFoundationModels(
+      messages: [GFTokenizer.Message],
+      tools: [GFTokenizer.FunctionDefinition]?,
+      interaction: AgentInteraction?
+    ) async throws -> (content: String, calls: [ParsedToolCall]) {
+      let model: any LanguageModel
+      switch pccPolicy {
+      case .disable, .auto:
+        guard SystemLanguageModel.default.availability == .available else {
+          throw AppleFoundationModelError.modelUnavailable(
+            "AFM 3 Core (SystemLanguageModel) is not available on this device."
+          )
+        }
+        model = SystemLanguageModel.default
+      case .require:
+        let pcc = PrivateCloudComputeLanguageModel()
+        guard pcc.availability == .available else {
+          throw AppleFoundationModelError.modelUnavailable(
+            "AFM Cloud Pro (PrivateCloudComputeLanguageModel) is not available."
+          )
+        }
+        model = pcc
+      }
+
+      let activeTools = tools ?? ToolRegistry.definitions
+      let toolCatalog = toolBridge.formatToolCatalog(tools: activeTools)
+      let basePrompt: String
+      if systemPrompt.count > 1500 {
+        basePrompt = """
+          You are TurboFieldfareAgent, an autonomous software engineering assistant running natively on Apple Silicon.
+          You have direct access to tools to inspect, read, create, and test code deliverables in your workspace.
+          Always fulfill tasks completely, create requested deliverable files, and verify them.
+          """
+      } else {
+        basePrompt = systemPrompt
+      }
+      let fullInstructions = """
+        \(basePrompt)
+
+        \(toolCatalog)
+        """
+
+      let promptText = toolBridge.formatConversationPrompt(messages: messages)
+
+      let session = LanguageModelSession(
+        model: model,
+        instructions: fullInstructions
+      )
+
+      var fullText = ""
+      let stream = session.streamResponse(to: promptText)
+      for try await snapshot in stream {
+        if let interaction, interaction.cancellation.isCancelled {
+          throw CancellationError()
+        }
+        fullText = snapshot.content
+      }
+
+      let (cleanContent, calls) = toolBridge.parseToolCalls(from: fullText)
+      let effectiveContent: String
+      if !calls.isEmpty {
+        if cleanContent.contains("Scratchpad Output")
+          || cleanContent.contains("Verification:")
+          || cleanContent.contains("Tool (")
+          || cleanContent.contains("Result:")
+        {
+          effectiveContent = ""
+        } else {
+          effectiveContent = cleanContent
+        }
+      } else {
+        effectiveContent = cleanContent
+      }
+
+      if let interaction {
+        if !effectiveContent.isEmpty {
+          interaction.text(effectiveContent)
+        }
+      } else {
+        if !effectiveContent.isEmpty {
+          AgentTerminal.output(effectiveContent + "\n")
+        }
+      }
+
+      return (effectiveContent, calls)
+    }
+  #endif
 }

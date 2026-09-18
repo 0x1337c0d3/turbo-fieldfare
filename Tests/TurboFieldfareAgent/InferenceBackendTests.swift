@@ -173,4 +173,58 @@ final class InferenceBackendTests: XCTestCase, @unchecked Sendable {
     ]
     XCTAssertEqual(router.checkHeuristics(messages: massiveMsg), .cloud)
   }
+
+  func testParseToolCalls() {
+    let bridge = MCPJSONSchemaBridge()
+    let rawOutput = """
+      Plan:
+      We will now implement the `Solver` class and test it.
+
+      ```tool_call
+      {"name": "write_file", "content": "class Solver:\\n    pass", "path": "scratch/solver.py"}
+      ```
+      """
+    let (clean, calls) = bridge.parseToolCalls(from: rawOutput)
+    XCTAssertEqual(calls.count, 1)
+    XCTAssertEqual(calls.first?.name, "write_file")
+    XCTAssertEqual(calls.first?.stringArgument("path"), "scratch/solver.py")
+    XCTAssertTrue(clean.contains("We will now implement"))
+  }
+
+  func testNormalizeBashArguments() {
+    let bridge = MCPJSONSchemaBridge()
+    let rawBash = """
+      ```tool_call
+      {"name": "execute_bash", "arguments": "python3 scratch/swe3/solver.py"}
+      ```
+      """
+    let (_, calls) = bridge.parseToolCalls(from: rawBash)
+    XCTAssertEqual(calls.count, 1)
+    XCTAssertEqual(calls.first?.name, "execute_bash")
+    XCTAssertEqual(calls.first?.stringArgument("command"), "python3 scratch/swe3/solver.py")
+  }
+
+  func testExtractPythonCodeFromMarkdown() {
+    let bridge = MCPJSONSchemaBridge()
+    let markdownContent = """
+      # Documentation
+      Here is the explanation.
+      ```python
+      import random
+      class Solver:
+          pass
+      ```
+      """
+    let rawCall = """
+      ```tool_call
+      {"name": "write_file", "path": "scratch/swe3/solver.py", "content": \(String(data: try! JSONEncoder().encode(markdownContent), encoding: .utf8)!)}
+      ```
+      """
+    let (_, calls) = bridge.parseToolCalls(from: rawCall)
+    XCTAssertEqual(calls.count, 1)
+    let content = calls.first?.stringArgument("content")
+    XCTAssertNotNil(content)
+    XCTAssertFalse(content!.contains("# Documentation"))
+    XCTAssertTrue(content!.contains("class Solver:"))
+  }
 }

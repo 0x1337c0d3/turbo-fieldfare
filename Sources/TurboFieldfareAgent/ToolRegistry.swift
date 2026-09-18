@@ -560,7 +560,23 @@ struct ToolRegistry {
   }
 
   private static func executeBash(call: ParsedToolCall, context: AgentToolContext) async -> String {
-    guard let command = call.stringArgument("command") else { return "Error: invalid arguments" }
+    let commandCandidate =
+      call.stringArgument("command")
+      ?? call.stringArgument("cmd")
+      ?? call.stringArgument("command_line")
+      ?? call.stringArgument("arguments")
+    let command: String
+    if let cmd = commandCandidate {
+      command = cmd
+    } else if case .object(let dict) = call.arguments,
+      case .array(let arr) = dict["arguments"]
+    {
+      command = arr.compactMap {
+        if case .string(let s) = $0 { return s } else { return nil }
+      }.joined(separator: " ")
+    } else {
+      return "Error: invalid arguments"
+    }
     let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.range(of: #"(?i)cat\s*<<\s*\\?['"]?[A-Za-z0-9_]+['"]?"#, options: .regularExpression)
       != nil
