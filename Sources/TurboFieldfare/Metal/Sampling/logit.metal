@@ -40,6 +40,26 @@ constant constexpr float kSampleTopMaxK     = 256.0f;  // cap for top-k mask sca
 // ----------------------------------------------------------------------------
 
 inline float softcap_value(float z, float softcap) {
+    // A NaN logit must not take the rest of the row with it. `max(x, NaN)` and
+    // `exp(NaN)` both stay NaN, so one bad value leaves the running max and the
+    // running sum NaN for the whole vocabulary and the normalized row NaN; the
+    // sampler can only answer an in-range index, so it answered token 0 for
+    // every remaining position and a broken model looked like a model that
+    // likes token 0. Folding it to the -inf the sum is already built to
+    // tolerate excludes that element and leaves the softmax over the *finite*
+    // logits, which is the distribution a reader expects.
+    //
+    // This has to come before the softcap == 0 early return: with capping
+    // disabled (`finalLogitSoftcap == 0`) there is no tanh to swallow it, and
+    // the NaN would reach the reduction unchanged.
+    //
+    // Only NaN is folded. A +inf logit is a claim rather than a failure, and
+    // `tanh` below saturates it to `softcap` -- the most likely token, which is
+    // what an infinite logit means.
+    if (isnan(z)) return -INFINITY;
+    // softcap <= 0 disables capping (architectures without a final logit
+    // softcap, e.g. Qwen 3.6).
+    if (softcap <= 0.0f) return z;
     // tanh saturates well before |z/softcap|=10, so values like +1e3 collapse
     // cleanly to softcap=30 without exp overflow downstream.
     return softcap * precise::tanh(z / softcap);
@@ -55,6 +75,7 @@ void logit_softcap_softmax(
     device       half*  probs    [[buffer(1)]],   // [V] FP16
     constant     uint&  V        [[buffer(2)]],
     constant     float& softcap  [[buffer(3)]],
+    device       float* row_max  [[buffer(4)]],   // [1] the max this row used
     uint  lid              [[thread_position_in_threadgroup]],
     uint  lsize            [[threads_per_threadgroup]],
     uint  simd_lane_id     [[thread_index_in_simdgroup]],
@@ -67,7 +88,6 @@ void logit_softcap_softmax(
     threadgroup float partial_d[kLogitMaxSimdGroups];
     threadgroup float final_m;
     threadgroup float final_inv_d;
-
     // -log-of-zero sentinel: any real logit beats this on the first compare.
     float m = -INFINITY;
     float d = 0.0f;
@@ -75,9 +95,17 @@ void logit_softcap_softmax(
     for (uint i = lid; i < V; i += lsize) {
         float z  = softcap_value(float(logits[i]), softcap);
         float mn = max(m, z);
-        // Guard against the (-inf, -inf) → (-inf, NaN) case on the first iter.
+        // Two guards, and the sum needs both. `scale` rescales the running sum
+        // to the new max; when the first element is -inf the running max is
+        // still -inf, so `exp(-inf - -inf)` would be NaN and `d * 0 + NaN`
+        // poisons the thread's sum for the rest of its elements even though a
+        // -inf logit contributes nothing. `contribution` is that term. This is
+        // reachable whenever the softcap is disabled (`finalLogitSoftcap == 0`,
+        // the Qwen 3.6 production setting) and a logit arrives as -inf: before
+        // this the row came out empty and the sampler answered token 0.
         float scale = (m == -INFINITY) ? 0.0f : logit_softmax_exp(m - mn);
-        d = d * scale + logit_softmax_exp(z - mn);
+        float contribution = (mn == -INFINITY) ? 0.0f : logit_softmax_exp(z - mn);
+        d = d * scale + contribution;
         m = mn;
     }
 
@@ -98,6 +126,21 @@ void logit_softcap_softmax(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // -- Cross-SIMD merge in SIMD-group 0. Up to kLogitMaxSimdGroups partials.
+    // The defaults are written by thread 0 only — the same thread that writes
+    // the real values below, so no barrier is needed between them.
+    //
+    // Writing them from every thread (to silence the sometimes-uninitialized
+    // diagnostic) is a data race: a thread in another SIMD group can store the
+    // default *after* lane 0 of group 0 has stored the real value, leaving
+    // final_m = -inf and final_inv_d = 0. The normalize loop below then
+    // computes exp(z - -inf) * 0 = inf * 0 = NaN for every entry, so the whole
+    // probability row becomes NaN. Downstream, `sample`'s top-k reduction finds
+    // no finite mass, every slot collapses to the UINT_MAX sentinel, and the
+    // draw returns an out-of-range token id.
+    if (lid == 0) {
+        final_m     = -INFINITY;
+        final_inv_d = 0.0f;
+    }
     if (simd_group_id == 0) {
         float mp = (simd_lane_id < simdgroups) ? partial_m[simd_lane_id] : -INFINITY;
         float dp = (simd_lane_id < simdgroups) ? partial_d[simd_lane_id] : 0.0f;
@@ -110,18 +153,152 @@ void logit_softcap_softmax(
         if (simd_lane_id == 0) {
             final_m     = m_all;
             // Reciprocal once so the normalize loop is a single multiply.
-            final_inv_d = 1.0f / d_all;
+            final_inv_d = (d_all > 0.0f) ? (1.0f / d_all) : 0.0f;
+            // Published so the host can tell an empty row from a peaked one
+            // without a vocabulary-sized readback. Non-finite here means the
+            // row carried no finite logit at all.
+            row_max[0] = m_all;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float m_final     = final_m;
     const float inv_d_final = final_inv_d;
+    // `m_final` is non-finite only when every logit was (the NaN fold above, or
+    // an all -inf row). The row then has no mass; writing zeros keeps it a
+    // *defined* empty distribution instead of exp(-inf - -inf) * 0 = NaN, so
+    // the sampler's own in-range fallback is what answers and the logits stay
+    // the only thing that was broken.
+    const bool has_mass = isfinite(m_final);
 
     for (uint i = lid; i < V; i += lsize) {
         float z = softcap_value(float(logits[i]), softcap);
-        probs[i] = half(logit_softmax_exp(z - m_final) * inv_d_final);
+        probs[i] = has_mass
+            ? half(logit_softmax_exp(z - m_final) * inv_d_final)
+            : half(0.0f);
     }
+}
+
+// ----------------------------------------------------------------------------
+// Tiled softcap+softmax. Same math as `logit_softcap_softmax`, but the two
+// full-vocabulary passes are spread across the device instead of running in
+// one 256-thread threadgroup. Stage 1 emits per-tile (max, sum-of-exp)
+// partials; stage 2 merges them into a single (max, 1/sum); stage 3
+// normalizes. At V = 248,320 the single-threadgroup form left the rest of the
+// GPU idle for both passes, which is the same pathology the tiled Top-K
+// reduction removed from the selection half.
+constant constexpr uint kSoftmaxTile = 4096;
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void logit_softcap_softmax_tiled_stage1(
+    device const half*  logits   [[buffer(0)]],
+    device float*       out_max  [[buffer(1)]],
+    device float*       out_sum  [[buffer(2)]],
+    constant uint&      V        [[buffer(3)]],
+    constant float&     softcap  [[buffer(4)]],
+    uint  group            [[threadgroup_position_in_grid]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float partial_m[kLogitMaxSimdGroups];
+    threadgroup float partial_d[kLogitMaxSimdGroups];
+    const uint base = group * kSoftmaxTile;
+    const uint end  = min(base + kSoftmaxTile, V);
+
+    float m = -INFINITY;
+    float d = 0.0f;
+    for (uint i = base + lid; i < end; i += lsize) {
+        float z  = softcap_value(float(logits[i]), softcap);
+        float mn = max(m, z);
+        // Same two guards as the single-threadgroup form, same reason.
+        float scale = (m == -INFINITY) ? 0.0f : logit_softmax_exp(m - mn);
+        float contribution = (mn == -INFINITY) ? 0.0f : logit_softmax_exp(z - mn);
+        d = d * scale + contribution;
+        m = mn;
+    }
+    float m_simd = simd_max(m);
+    float d_simd = simd_sum((m == -INFINITY) ? 0.0f : d * logit_softmax_exp(m - m_simd));
+    if (simd_lane_id == 0) {
+        partial_m[simd_group_id] = m_simd;
+        partial_d[simd_group_id] = d_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float mp = (simd_lane_id < simdgroups) ? partial_m[simd_lane_id] : -INFINITY;
+        float dp = (simd_lane_id < simdgroups) ? partial_d[simd_lane_id] : 0.0f;
+        float m_all = simd_max(mp);
+        float d_all = simd_sum((mp == -INFINITY) ? 0.0f : dp * logit_softmax_exp(mp - m_all));
+        if (simd_lane_id == 0) {
+            out_max[group] = m_all;
+            out_sum[group] = d_all;
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void logit_softcap_softmax_tiled_merge(
+    device const float* in_max   [[buffer(0)]],
+    device const float* in_sum   [[buffer(1)]],
+    device float*       out_pair [[buffer(2)]],   // [max, 1/sum]
+    constant uint&      tiles    [[buffer(3)]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float partial_m[kLogitMaxSimdGroups];
+    threadgroup float partial_d[kLogitMaxSimdGroups];
+    float m = -INFINITY;
+    float d = 0.0f;
+    for (uint i = lid; i < tiles; i += lsize) {
+        float tm = in_max[i];
+        float mn = max(m, tm);
+        float scale = (m == -INFINITY) ? 0.0f : logit_softmax_exp(m - mn);
+        float contribution = (tm == -INFINITY)
+            ? 0.0f : in_sum[i] * logit_softmax_exp(tm - mn);
+        d = d * scale + contribution;
+        m = mn;
+    }
+    float m_simd = simd_max(m);
+    float d_simd = simd_sum((m == -INFINITY) ? 0.0f : d * logit_softmax_exp(m - m_simd));
+    if (simd_lane_id == 0) {
+        partial_m[simd_group_id] = m_simd;
+        partial_d[simd_group_id] = d_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float mp = (simd_lane_id < simdgroups) ? partial_m[simd_lane_id] : -INFINITY;
+        float dp = (simd_lane_id < simdgroups) ? partial_d[simd_lane_id] : 0.0f;
+        float m_all = simd_max(mp);
+        float d_all = simd_sum((mp == -INFINITY) ? 0.0f : dp * logit_softmax_exp(mp - m_all));
+        if (simd_lane_id == 0) {
+            out_pair[0] = m_all;
+            out_pair[1] = (d_all > 0.0f) ? (1.0f / d_all) : 0.0f;
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void logit_softcap_softmax_tiled_normalize(
+    device const half*  logits   [[buffer(0)]],
+    device half*        probs    [[buffer(1)]],
+    device const float* pair     [[buffer(2)]],
+    constant uint&      V        [[buffer(3)]],
+    constant float&     softcap  [[buffer(4)]],
+    uint  gid [[thread_position_in_grid]]
+) {
+    if (gid >= V) return;
+    const float z = softcap_value(float(logits[gid]), softcap);
+    // Same no-mass rule as the single-threadgroup form; `pair[0]` is the row
+    // max the merge pass settled on and is non-finite only for a row with no
+    // finite logit at all.
+    probs[gid] = isfinite(pair[0])
+        ? half(logit_softmax_exp(z - pair[0]) * pair[1])
+        : half(0.0f);
 }
 
 // ----------------------------------------------------------------------------
@@ -429,8 +606,15 @@ void sample(
         // Default to slot 0 (the global argmax — always a valid index) so a
         // CDF that never crosses u (FP rounding leaves run slightly below the
         // surviving mass) still returns a real token, never a tail sentinel.
+        // `kept == 0` means slot 0 itself failed the `< V` / isfinite test
+        // above — every entry reduced to the UINT_MAX sentinel, which happens
+        // when the probability row carries no finite mass. Seeding `picked`
+        // from topk_idx[0] unconditionally would then emit that sentinel as a
+        // token id. Fall back to a real index instead: an arbitrary token beats
+        // an out-of-range one that the generation loop would use to index the
+        // vocabulary.
         float run = 0.0f;
-        uint  picked = topk_idx[0];
+        uint  picked = (kept > 0) ? topk_idx[0] : 0u;
         for (uint i = 0; i < kept; ++i) {
             run += topk_val[i];
             if (u <= run) { picked = topk_idx[i]; break; }
@@ -550,6 +734,7 @@ void sample_topk64_final(
     constant float& temperature [[buffer(4)]],
     constant float& top_p [[buffer(5)]],
     constant uint64_t& seed [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
     uint lid [[thread_position_in_threadgroup]]) {
     threadgroup float values[1024];
     threadgroup uint indices[1024];
@@ -568,6 +753,16 @@ void sample_topk64_final(
                && isfinite(values[kept])) {
             kept += 1;
         }
+
+        // Top-K caps the working set *before* the Top-P scan, which is what
+        // makes this path bit-identical to the generic `sample` kernel for
+        // k <= 64. There, only k slots are ever extracted, so the cumulative
+        // mass Top-P compares against is the mass of the top k — not of the
+        // top 64. Cutting after Top-P instead would let a distribution whose
+        // 0.95 mass is reached at rank 30 keep 30 candidates at k=20, where
+        // the generic kernel keeps 20. Order matters; this is not a clamp
+        // that can be moved for tidiness.
+        kept = min(kept, max(1u, top_k));
 
         if (top_p > 0.0f && top_p < 1.0f) {
             float cumulative = 0.0f;
@@ -595,7 +790,12 @@ void sample_topk64_final(
         (void)xorshift64(rng);
         float u = uniform01(rng) * surviving;
         float running = 0.0f;
-        uint picked = indices[0];
+        // Same fallback as the generic `sample` kernel, for the same reason:
+        // `kept == 0` means every slot failed the isfinite test, so `indices[0]`
+        // is still the UINT_MAX sentinel. Emitting it hands the generation loop
+        // an out-of-range id to index the vocabulary with. The default path for
+        // topK <= 64 is this kernel, not the generic one.
+        uint picked = (kept > 0) ? indices[0] : 0u;
         for (uint i = 0; i < kept; ++i) {
             running += values[i];
             if (u <= running) {

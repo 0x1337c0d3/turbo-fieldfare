@@ -1,95 +1,47 @@
 ---
 name: pr
-description: Security review → confirm with user → push branch → open PR with structured body.
+description: Security-review, validate, confirm the push, and open a TurboFieldfare pull request with a structured test and safety record.
 ---
 
 # /pr
 
-Raise a pull request. Security review runs first, the user confirms the push, then `gh` opens the PR.
+Raise a pull request from a feature branch. Never push before receiving the
+user's explicit confirmation for that push.
 
-## Steps
+1. Confirm the current branch is not `main` or `master` and identify its merge
+   base with `main`.
+2. Run `/security-review` on the branch diff. Critical/High findings block the
+   PR; ask how to handle Medium findings; carry Low/Info notes into the body.
+   If code changes, re-run `/test` and any affected build/check gate.
+3. Ask: `Ready to push <branch> to origin and open a PR?` Stop on refusal.
+4. Push with `git push -u origin <branch>`. Do not force-push after a rejection.
+5. Open the PR with a conventional, at-most-72-character title and this body:
 
-### 1. Branch sanity
+   ```markdown
+   ## Summary
 
-```bash
-git rev-parse --abbrev-ref HEAD
-```
+   - <user-visible change>
 
-If the current branch is `main` (or `master`): **halt.** PRs come from feature branches. Tell the user to switch.
+   ## Test plan
 
-### 2. Security review
+   - [ ] `swift build -c release`
+   - [ ] `Scripts/test.sh`
+   - [ ] Relevant repository checks pass
+   - [ ] Any model run followed the AGENTS.md preflight (or: no model run)
 
-Run `/security-review` against the branch diff (`git diff $(git merge-base HEAD main)...HEAD`).
+   ## Security notes
 
-Handle findings:
+   <self-contained /security-review result with file:line references>
 
-- **Critical / High:** halt. The user must address them before the PR opens. Do not auto-apply security fixes — surface them and let the user decide.
-- **Medium:** surface, ask whether to address pre-PR or defer to a follow-up.
-- **Low / Info:** include in the PR body's Security notes; do not block.
+   ## Notes
 
-If anything was fixed: re-run `/test` to confirm no regressions.
+   <protocol deviations, skipped checks, or follow-ups; omit if empty>
+   ```
 
-### 3. Confirm push with the user
+   Use `gh pr create`; use `--draft` when the work is not ready rather than a
+   title tag.
+6. Return the PR URL.
 
-This confirmation is **per-push**. A previous approval does not carry over.
-
-Ask, explicitly: *"Ready to push `<branch>` to origin and open a PR? (yes/no)"*
-
-On `no`: stop and report nothing was pushed.
-
-### 4. Push
-
-```bash
-git push -u origin <branch>
-```
-
-If the remote rejects the push (non-fast-forward, branch protection, etc.): do **not** force-push. Report the error and ask the user.
-
-### 5. Open the PR
-
-Compose the PR body with this structure:
-
-```markdown
-## Summary
-
-- <bullet: what changed, in user-visible terms>
-- <bullet: ...>
-
-## Test plan
-
-- [ ] <how to verify the change works>
-- [ ] <edge case covered>
-- [ ] CI tests pass (`cargo test`, clippy clean, coverage ≥ 80%)
-
-## Security notes
-
-<verbatim output from /security-review — keep the file:line refs>
-
-## Notes
-
-<anything else worth flagging to a reviewer — out-of-scope follow-ups, deferred work, etc. Omit if empty.>
-```
-
-Then:
-
-```bash
-gh pr create --title "<conventional commit subject>" --body "$(cat <<'EOF'
-<body above>
-EOF
-)"
-```
-
-Title rules:
-
-- Match the most representative commit's subject (or compose a new conventional-commit subject if the branch has many commits).
-- ≤ 72 chars. No emoji. No `[WIP]` tags — if it's WIP, use `gh pr create --draft`.
-
-### 6. Report
-
-Return the PR URL on its own line so the user can click it. Nothing else needed.
-
-## Don't
-
-- Don't push before the user confirms in step 3, even if `/security-review` is clean.
-- Don't open a PR with un-addressed Critical/High security findings.
-- Don't force-push to shared branches without an explicit user request — and even then, never to `main`.
+Never claim performance from ordinary tests. For benchmark changes/results,
+use `docs/COMMUNITY_BENCHMARKS.md` and include the required commit, hardware,
+RAM, macOS, Swift, exact command, timing footer/error, and deviations.

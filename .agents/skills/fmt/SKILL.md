@@ -1,42 +1,28 @@
 ---
 name: fmt
-description: Format Rust code with rustfmt and report what changed.
+description: Format changed Swift source files with the formatter bundled in the active Swift toolchain and report what changed.
 ---
 
 # /fmt
 
-Format the codebase. Single source of formatting truth.
+Format only Swift files in the requested change unless the user explicitly
+asks to format the whole repository. This avoids unrelated repository-wide
+churn when no `.swift-format` configuration is present.
 
-## Steps
+1. Read `AGENTS.md` and verify `swift format --version` succeeds.
+2. Determine the target files from explicit user paths, otherwise from staged,
+   unstaged, and untracked files. Include `Package.swift` and files ending in
+   `.swift`; exclude `.build/` and dependency checkouts.
+3. Run:
 
-### 1. Verify rustfmt is installed
+   ```bash
+   swift format format --in-place --parallel <files...>
+   ```
 
-```bash
-rustup component list --installed | grep rustfmt
-```
+4. Inspect `git diff --check` and `git diff --name-only`. Report the files the
+   formatter changed, or say that they were already formatted. If parsing
+   fails, report the file and diagnostic; do not repair unrelated syntax as
+   part of formatting.
 
-If missing: `rustup component add rustfmt`. If that fails, halt with "Run /setup first."
-
-### 2. Run rustfmt
-
-```bash
-cargo fmt
-```
-
-Capture the output. `cargo fmt` reformats all `.rs` files in the workspace in place.
-
-### 3. Report what changed
-
-```bash
-git diff --name-only
-```
-
-Parse the list to find `.rs` files that were modified by the formatter.
-
-Report one of:
-
-- **Reformatted:** list the files that were rewritten (`file:` per line).
-- **Already formatted:** print "Nothing to do — all files already formatted."
-- **Error:** print the offending file and the error verbatim. Do **not** attempt to fix syntax errors — they must be resolved by the user.
-
-Do not run in `--check` mode here — `/fmt` is the *apply* step. The PostToolUse hook is the *check* step. The `/commit` gate runs `--check` separately.
+`/fmt` applies formatting. Commit-time checking uses `swift format lint
+--strict` against the intended Swift files.

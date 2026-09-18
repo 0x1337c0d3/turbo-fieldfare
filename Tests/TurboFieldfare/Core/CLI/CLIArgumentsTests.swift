@@ -116,7 +116,7 @@ import TurboFieldfare
             "--temperature", "--top-k", "--top-p", "--repetition-penalty",
             "--seed", "--stop", "--quiet", "--expert-cache-slots",
             "--expert-cache-policy", "--prefill", "--prefill-chunk-tokens",
-            "--rdadvise", "--help",
+            "--rdadvise", "--yolo", "--help",
             "--chat-prompt", "--image", "--vision-pack", "--vision-residency",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }

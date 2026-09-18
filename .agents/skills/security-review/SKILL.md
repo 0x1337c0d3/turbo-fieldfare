@@ -1,133 +1,113 @@
 ---
 name: security-review
-description: Complete a security review of pending changes on the current branch. Focuses on unsafe code, injection, secrets, memory safety at FFI boundaries, insecure deserialization, path traversal, and supply-chain risk. Use when the user asks to "security review", "security audit", "check for vulns", or before raising a PR.
+description: Security-review pending TurboFieldfare Swift, Metal, server, installer, and package changes for concrete exploitable flaws and supply-chain risk.
 ---
 
 # Security Review Skill
 
-You are conducting a security review of the changes on this branch. The goal is to find real, exploitable issues — not produce a generic checklist.
+Find concrete, exploitable issues in the change; do not emit a generic
+checklist.
 
-## Step 1 — Determine review scope
+## Scope and context
 
-1. If the user names a PR, fetch via `gh pr diff <n>`.
-2. Otherwise review branch vs `main`:
-   ```bash
-   base=$(git merge-base HEAD main)
-   git diff "$base"...HEAD --name-only
-   git diff "$base"...HEAD
-   ```
-3. If neither produces a diff, fall back to staged changes (`git diff --cached`).
+Use a user-named PR when supplied. Otherwise review the current branch against
+its merge base with `main`, falling back to staged changes when there is no
+branch diff. State the scope, read each changed file in full, and read
+`AGENTS.md` plus relevant server, format, installer, and runtime documentation.
+Note changes to `Package.swift`, `Package.resolved`, build plugins, binary
+targets, scripts, and GitHub Actions.
 
-State the scope in one sentence.
+## Threat focus
 
-## Step 2 — Gather context
+For a finding, cite a specific line and describe a plausible attacker action
+and impact.
 
-- Read each changed file **in full** — security bugs hide in surrounding context (where input enters, how output is used, what privileges the process holds).
-- Read any `AGENTS.md` and `.env-template` files to understand secrets handling
-  and trust boundaries.
-- Note any new dependencies added to `Cargo.toml` / `Cargo.lock`.
+**Memory, Metal, and FFI safety**
 
-## Step 3 — Threat focus
+- Raw pointers or buffer bindings derived from untrusted sizes without checked
+  range/alignment validation.
+- Pointers escaping `withUnsafeBytes`/`withUnsafeMutableBytes`, incorrect
+  `Data(bytesNoCopy:)` deallocators, use-after-unmap, or C/Objective-C ownership
+  mistakes.
+- Metal buffer length, offset, thread-grid, or shader struct assumptions that
+  let malformed model/image data produce out-of-bounds GPU access.
 
-Review for the following classes. For each finding, point to a **specific line** and describe a **plausible attacker action**. Vague concerns are not findings.
+**Parsing, files, and installer transactions**
 
-**Unsafe code**
-- `unsafe` blocks without a `// SAFETY:` comment that justifies all invariants.
-- Raw pointer dereference from untrusted sources (network, file, env).
-- `transmute` between non-trivially-related types.
-- FFI boundaries that accept user-controlled sizes or pointers without validation.
-- Use-after-free patterns in manual lifetime management.
+- Unbounded reads/decodes, allocation before validating lengths, decompression
+  bombs, integer conversion/overflow, overlapping ranges, and acceptance of
+  non-canonical or partially verified `.gturbo` state.
+- User-controlled paths joined or opened without containment checks, symlink
+  races, archive traversal, unsafe temporary-file permissions, and
+  check-then-use transaction gaps.
+- Resume/checkpoint logic that trusts unverified bytes or can publish a partial
+  pack as complete.
 
-**Injection — command execution**
-- `std::process::Command` where any argument is built from user input without allowlisting.
-- Shell expansion via `sh -c` with unsanitised input.
+**Server and command injection**
 
-**Injection — query/template**
-- SQL: string concatenation into queries instead of parameterised statements (sqlx, diesel).
-- Format strings built from user-controlled data passed to log macros (log injection / log forging).
+- Binding anywhere other than `127.0.0.1`, permissive CORS, proxy/tunnel
+  assumptions, request bodies without size limits, unsafe connection/resource
+  accounting, or endpoints that expose local files or internal errors.
+- `Process` calls that pass untrusted input through a shell (`sh -c`, `bash -c`)
+  or allow executable/path selection. Passing a value as a distinct argument is
+  not shell injection by itself.
+- Tool-call handling that weakens or bypasses the client's normal permission
+  policy.
 
-**Deserialisation**
-- `serde` deserialising untrusted input into types that execute logic in `Deserialize` impls.
-- `bincode` / `rmp-serde` / `postcard` decoding of untrusted bytes without length limits.
-- `serde_yaml::from_str` with untrusted YAML (YAML merge keys can cause unexpected behaviour).
-- `std::io::Read` without a size cap on untrusted streams (memory exhaustion).
+**Concurrency and state isolation**
 
-**Path traversal & file handling**
-- `std::fs::File::open(user_input)` or `std::path::Path::join(user_input)` without canonicalisation and prefix check.
-- Zip/tar extraction using paths from the archive without strip/containment (`zip_extract`, `tar` crate).
+- Races in conversation admission, cancellation, model/KV lineage ownership,
+  installer publication, or decode-service IPC.
+- Actor isolation escapes, unchecked continuations, locks across suspension,
+  and TOCTOU between validation and use.
+- Cross-request leakage of prompts, images, cached tokens, model paths, or
+  retained conversation state.
 
-**AuthN / AuthZ**
-- New endpoints or handlers lacking auth checks present on siblings.
-- Authorisation decisions made on client-supplied IDs without ownership verification (IDOR).
-- Hardcoded credentials, API keys, or default passwords in source or config.
-- Token/session handling: weak generation (`rand::random` instead of `rand::rngs::OsRng`), missing expiry.
+**Images and fail-closed behaviour**
 
-**Secrets & data exposure**
-- Secrets committed to the repo (high-entropy strings, `AKIA*`, `ghp_*`, `xoxb-*`, PEM blocks).
-- Secrets written to logs, error messages, or `Display` / `Debug` impls on types that hold credentials.
-- Sensitive fields in structs that derive `Debug` without a custom redacting impl.
+- Missing/invalid vision companion packs being ignored after accepting an
+  image, or an image request continuing as text-only.
+- Image dimensions, pixel counts, decoded bytes, or multipart/base64 payloads
+  accepted without limits before allocation.
 
-**Crypto**
-- MD5 / SHA1 for security purposes (`md5` crate, `sha1` crate).
-- Static IVs, hardcoded keys, ECB mode.
-- `rand::thread_rng()` for security-sensitive tokens — use `OsRng`.
-- TLS verification disabled (`danger_accept_invalid_certs`, `danger_accept_invalid_hostnames`).
+**Secrets, crypto, and supply chain**
 
-**Integer safety**
-- Unchecked arithmetic on attacker-controlled values in release mode (overflow wraps silently).
-- Casting user-supplied `usize` to `i32` or vice versa without range check.
-- Buffer indexing with user-supplied offsets without bounds validation before the index.
-
-**Supply chain**
-- New `Cargo.toml` dependencies: are they pinned in `Cargo.lock`? Are they from trusted sources?
-- Typosquat-prone names (`serdé`, `actx-web`).
-- Build scripts (`build.rs`) — do new deps introduce one? Build scripts run at compile time with full system access.
-- `cargo audit` output: check if any added crate has known CVEs.
+- Tokens or credentials in source, fixtures, logs, diagnostics, crash output,
+  or overly descriptive values; TLS verification disabled for downloads.
+- Weak randomness or hashes used for authentication/integrity, unsigned or
+  insufficiently verified remote content, and checksums compared
+  non-atomically or against the wrong bytes.
+- New SwiftPM packages that are unnecessary, unexpectedly unpinned, sourced
+  from an untrusted URL/revision, add executable build plugins, or alter
+  `Package.resolved` unexpectedly. Use an appropriate current advisory source
+  when dependency risk is material; use a source that actually covers SwiftPM.
 
 **Insecure defaults**
-- Binding to `0.0.0.0` without justification.
-- Permissive CORS (`*`), disabled CSRF.
-- `debug_assertions`-gated checks that should also run in release.
 
-**Race conditions & TOCTOU**
-- File existence check followed by open in separate syscalls.
-- `Mutex` lock dropped early (temporary borrow) before a dependent operation completes.
-- `Arc<Mutex<_>>` held across `.await` (deadlock risk in async context).
+- Runtime protections present only in assertions/debug builds.
+- Changes that loosen safe defaults, enable experimental controls, expose the
+  loopback service, or convert a validation failure into fallback behaviour.
 
-## Step 4 — Report
+## Report
 
-Use **CVSS-flavoured severity** (Critical / High / Medium / Low / Info), ranked by *exploitability in this codebase*, not the abstract worst case.
+Rank by exploitability in this codebase using Critical / High / Medium / Low /
+Info. Use this form, omitting empty severity headings:
 
-```
-## Security Review: <one-line scope>
-
-### Critical
-- **`file.rs:42` — <vuln class>**
-  Attack: <what an attacker does, concretely>
-  Fix: <one-line remediation>
+```markdown
+## Security Review: <scope>
 
 ### High
-- ...
-
-### Medium
-- ...
-
-### Low / Info
-- ...
+- **`path/File.swift:42` — <class>**
+  Attack: <concrete attacker action and impact>
+  Fix: <concise remediation>
 
 ### Out of scope / accepted
-<things you considered but ruled out — terse, only if non-obvious>
+<only non-obvious exclusions>
 
 ### Verdict
-<one sentence: safe to ship / fix blockers first / needs broader threat modelling>
+<safe to ship, fix blockers first, or needs broader threat modelling>
 ```
 
-Rules:
-- Always cite `file:line`. No findings without a concrete location.
-- A "finding" needs a plausible attacker and a plausible impact. If you can't write the Attack line, it's at most an Info note.
-- Do NOT pad with generic advice the reader already knows.
-- If the diff is security-clean, say so in one line and end with the Verdict.
-
-## Step 5 — If invoked from `/pr`
-
-When the caller is `/pr`, your output is embedded in the PR body's **Security notes** section. Keep the report self-contained — anyone reading the PR should understand each finding without running the skill themselves.
+A finding requires a location and plausible attack; otherwise make it an Info
+note or omit it. When called from `/pr`, keep the result self-contained for the
+PR body.

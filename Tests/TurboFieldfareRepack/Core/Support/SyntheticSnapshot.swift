@@ -30,7 +30,9 @@ enum SyntheticSnapshot {
 
     /// Build the snapshot. `seed` controls the pseudo-random payload bytes so
     /// tests can pre-compute byte-fidelity expectations.
-    static func build(at dir: String, seed: UInt64 = 0xA17B_EEF1_5FAC_E202) throws -> Snapshot {
+    static func build(at dir: String,
+                      seed: UInt64 = 0xA17B_EEF1_5FAC_E202,
+                      sharedExpertBits: Int = 8) throws -> Snapshot {
         try? FileManager.default.removeItem(atPath: dir)
         try FileManager.default.createDirectory(atPath: dir,
                                                 withIntermediateDirectories: true)
@@ -91,16 +93,16 @@ enum SyntheticSnapshot {
             appendUnquantizedBF16(name: prefix + ".layer_scalar",
                                   shape: [1], into: &tensors, rng: &rng)
 
-            // Shared-expert mlp — 8-bit affine
+            // Shared-expert mlp
             appendQuantizedWeight(name: prefix + ".mlp.gate_proj",
                                   outerShape: [arch.intermediate], innerLogical: arch.hidden,
-                                  bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                                  bits: sharedExpertBits, groupSize: arch.groupSize, into: &tensors, rng: &rng)
             appendQuantizedWeight(name: prefix + ".mlp.up_proj",
                                   outerShape: [arch.intermediate], innerLogical: arch.hidden,
-                                  bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                                  bits: sharedExpertBits, groupSize: arch.groupSize, into: &tensors, rng: &rng)
             appendQuantizedWeight(name: prefix + ".mlp.down_proj",
                                   outerShape: [arch.hidden], innerLogical: arch.intermediate,
-                                  bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                                  bits: sharedExpertBits, groupSize: arch.groupSize, into: &tensors, rng: &rng)
 
             // Routed experts — 4-bit affine, leading dim = numExperts
             appendQuantizedWeight(name: prefix + ".experts.switch_glu.gate_proj",
@@ -148,9 +150,10 @@ enum SyntheticSnapshot {
         var overrides: [String: [String: Any]] = [:]
         for li in 0..<arch.numLayers {
             let prefix = "language_model.model.layers.\(li)"
-            for k in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "router.proj"] {
-                overrides[prefix + "." + k] = ["bits": 8, "group_size": arch.groupSize]
+            for k in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                overrides[prefix + "." + k] = ["bits": sharedExpertBits, "group_size": arch.groupSize]
             }
+            overrides[prefix + ".router.proj"] = ["bits": 8, "group_size": arch.groupSize]
         }
         var quant: [String: Any] = [
             "bits": 4, "group_size": arch.groupSize, "mode": "affine"

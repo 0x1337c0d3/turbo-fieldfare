@@ -155,7 +155,6 @@ final class AgentSession {
         printColor("\nType ? and press Enter for commands, skills, and built-in tools.\n", color: "gray")
         while let input = readInput() {
             if input == "/exit" || input == "/quit" { 
-                await runConsolidation()
                 break 
             }
             if await handleCommand(input) { continue }

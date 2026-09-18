@@ -1,63 +1,45 @@
 ---
 name: test
-description: Run cargo test with llvm-cov coverage, enforce gates, name uncovered lines on modified files.
+description: Run TurboFieldfare's serial Swift package tests through Scripts/test.sh, with the required safeguards for any real-model test.
 ---
 
 # /test
 
-Run the test suite with coverage. Coverage threshold is 80% — this command surfaces *why* and *where* when it fails.
+Run package tests through the repository wrapper; shared Metal state makes
+parallel execution unreliable.
 
-## Steps
+## Package tests
 
-### 1. Run tests with coverage
-
-```bash
-cargo llvm-cov --all-features --workspace --summary-only 2>&1
-```
-
-Capture exit code and stdout. If `cargo llvm-cov` is not installed, halt: "Run /setup first — cargo-llvm-cov is not installed."
-
-For more detail when diagnosing uncovered lines, use:
+Use the whole suite unless the user asks for a focused filter:
 
 ```bash
-cargo llvm-cov --all-features --workspace 2>&1
+Scripts/test.sh
+Scripts/test.sh --filter <test-or-suite>
 ```
 
-### 2. Parse results
+Pass supported `swift test` arguments through the wrapper. Never invoke
+`swift test` directly and never add parallelism. Capture the exact command,
+exit code, elapsed time, failures, and skips. This repository defines no local
+coverage threshold, so do not invent or enforce one.
 
-Extract from stdout:
+Before running, determine whether the selected suite can open an installed
+model pack. Treat a full-suite run as model-using when the required real model
+artifacts are present.
 
-- Pass / fail / ignore counts (from the `test result:` line, e.g. `test result: ok. 5 passed; 0 failed; 0 ignored`).
-- Overall line coverage % from the `TOTAL` row in the coverage summary.
-- Coverage threshold: **80%** (hardcoded gate — customize in `AGENTS.md` if the
-  project differs).
+## Tests that load a real model
 
-### 3. Gate: test failures
+Before any run that can load the real model, apply every preflight in
+`AGENTS.md`: macOS and Swift versions, disk, `memory_pressure -Q`, completed
+model pack, and the full process check. If any check fails, report it and stop.
+Do not terminate an app/process, reinstall or delete a model, or run more than
+one app, CLI, or model-using test at once.
 
-If any test failed:
+Ordinary model-free package tests may run without a model; model-dependent
+cases are expected to skip when their packs are absent.
 
-- **Stop.** Do not proceed to commit-related work.
-- List each failing test: `<test_name> — <one-line failure reason>`.
-- If there's an obvious cause (assertion, panic, fixture error), name it. Don't paste the full output unless the user asks.
+## Report
 
-### 4. Gate: coverage failure
-
-If coverage is below threshold:
-
-- Identify recently modified source files: `git diff --name-only HEAD~1 HEAD -- '**/*.rs'` and `git diff --name-only -- '**/*.rs'`.
-- Run full coverage report for those files:
-  ```bash
-  cargo llvm-cov --all-features --workspace 2>&1
-  ```
-- For each modified file, list the uncovered line ranges.
-- Suggest concrete test cases (one bullet per uncovered branch). Be specific — `test_parse_returns_err_on_empty_input`, not "add more tests".
-
-### 5. Pass case
-
-If everything is green, report:
-
-```
-PASS  <N> passed, <M> ignored
-COVER <X>% line coverage (threshold: 80%)
-TIME  <Z>s
-```
+On failure, name each failing test and its useful diagnostic. On success,
+report pass/skip totals when emitted, elapsed time, and `PASS`. If the run is a
+performance measurement, additionally follow `docs/COMMUNITY_BENCHMARKS.md`
+exactly and report every required environment field and protocol deviation.

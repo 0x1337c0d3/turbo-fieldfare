@@ -93,6 +93,17 @@ struct RepackPlan: Sendable {
     let excludedMultimodalTensorNames: [String]
 }
 
+struct SharedExpertOverrides: Sendable {
+    struct Entry: Sendable {
+        let weight: SourceTensor
+        let scales: SourceTensor
+        let biases: SourceTensor
+        let quantSpec: QuantSpec
+    }
+
+    let entries: [String: Entry]
+}
+
 // MARK: - Planner
 
 struct VisionPackPlan: Sendable {
@@ -111,6 +122,77 @@ struct VisionPackPlan: Sendable {
 }
 
 enum RepackPlanner {
+
+    static func sharedExpertOverrides(
+        meta: IndexLoader.SourceMetadata,
+        arch: ArchInfo,
+        shardHeaders: [Safetensors.Header],
+        sourceNamespace: String
+    ) throws -> SharedExpertOverrides {
+        guard !sourceNamespace.isEmpty,
+              !sourceNamespace.contains("/") else {
+            throw RepackError.configurationInvalid(
+                detail: "shared-expert source namespace must be one path component")
+        }
+        guard meta.baseGroupSize == 64,
+              meta.baseMode.lowercased() == "affine" else {
+            throw RepackError.configurationInvalid(
+                detail: "shared-expert override requires MLX affine group-64 metadata")
+        }
+
+        var registry: [String: SourceTensor] = [:]
+        for header in shardHeaders {
+            for tensor in header.tensors {
+                registry[tensor.name] = SourceTensor(
+                    name: tensor.name,
+                    shardPath: sourceNamespace + "/" + tensor.shardPath,
+                    dtype: tensor.dtype,
+                    shape: tensor.shape,
+                    absoluteOffset: tensor.absoluteOffset,
+                    sizeBytes: tensor.sizeBytes)
+            }
+        }
+
+        var entries: [String: SharedExpertOverrides.Entry] = [:]
+        for layer in 0..<arch.numLayers {
+            let prefix = "language_model.model.layers.\(layer).mlp."
+            let roles: [(String, [UInt64])] = [
+                ("gate_proj", [UInt64(arch.intermediateSize), UInt64(arch.hiddenSize)]),
+                ("up_proj", [UInt64(arch.intermediateSize), UInt64(arch.hiddenSize)]),
+                ("down_proj", [UInt64(arch.hiddenSize), UInt64(arch.intermediateSize)]),
+            ]
+            for (role, expectedLogicalShape) in roles {
+                let name = prefix + role + ".weight"
+                let base = String(name.dropLast(".weight".count))
+                guard let weight = registry[name],
+                      let scales = registry[base + ".scales"],
+                      let biases = registry[base + ".biases"] else {
+                    throw RepackError.configurationInvalid(
+                        detail: "8-bit shared-expert source is missing \(base)")
+                }
+                let spec = IndexLoader.quantSpec(forTensor: name, meta: meta)
+                guard spec.bits == 8,
+                      weight.dtype == .u32,
+                      logicalShape(forPackedSource: weight.shape, bits: spec.bits)
+                        == expectedLogicalShape,
+                      scales.dtype == .bf16,
+                      biases.dtype == .bf16,
+                      scales.shape == biases.shape,
+                      scales.shape == [expectedLogicalShape[0],
+                                       expectedLogicalShape[1] / UInt64(meta.baseGroupSize)] else {
+                    throw RepackError.configurationInvalid(
+                        detail: "shared-expert override \(base) is not 8-bit affine group-64 with the expected shape")
+                }
+                entries[name] = .init(
+                    weight: weight, scales: scales, biases: biases, quantSpec: spec)
+            }
+        }
+        guard entries.count == arch.numLayers * 3 else {
+            throw RepackError.configurationInvalid(
+                detail: "8-bit shared-expert source has an incomplete tensor set")
+        }
+        return SharedExpertOverrides(entries: entries)
+    }
 
     static func planVisionCompanion(
         meta: IndexLoader.SourceMetadata,
@@ -235,7 +317,8 @@ enum RepackPlanner {
     static func plan(meta: IndexLoader.SourceMetadata,
                             arch: ArchInfo,
                             shardHeaders: [Safetensors.Header],
-                            outputDir: String) throws -> RepackPlan {
+                            outputDir: String,
+                            sharedExpertOverrides: SharedExpertOverrides? = nil) throws -> RepackPlan {
 
         // Companion tensors may live in different shards, so resolve them
         // through one global registry.
@@ -280,7 +363,8 @@ enum RepackPlanner {
         let residentPath = (outputDir as NSString).appendingPathComponent("model_weights.bin")
         let resident = try planResidentFile(path: residentPath,
                                             baseNames: lmResidentBases,
-                                            registry: registry, meta: meta)
+                                            registry: registry, meta: meta,
+                                            sharedExpertOverrides: sharedExpertOverrides)
 
         let layersDir = (outputDir as NSString).appendingPathComponent("packed_experts")
         var layerPlans: [LayerFilePlan] = []
@@ -331,7 +415,8 @@ enum RepackPlanner {
     private static func planResidentFile(path: String,
                                          baseNames: [String],
                                          registry: [String: SourceTensor],
-                                         meta: IndexLoader.SourceMetadata) throws
+                                         meta: IndexLoader.SourceMetadata,
+                                         sharedExpertOverrides: SharedExpertOverrides?) throws
                                         -> ResidentFilePlan {
         let entryCount = baseNames.count
 
@@ -355,25 +440,28 @@ enum RepackPlanner {
         entries.reserveCapacity(entryCount)
 
         for name in baseNames {
-            guard let weight = registry[name] else {
+            guard let primaryWeight = registry[name] else {
                 throw RepackError.missingTensor(name: name)
             }
+            let override = sharedExpertOverrides?.entries[name]
+            let weight = override?.weight ?? primaryWeight
             let dtype = ietnyDtype(weight.dtype)
             let isQuantizedPacked = (weight.dtype == .u32) && name.hasSuffix(".weight")
 
             if isQuantizedPacked {
                 let base = String(name.dropLast(".weight".count))
-                guard let scales = registry[base + ".scales"] else {
+                guard let scales = override?.scales ?? registry[base + ".scales"] else {
                     throw RepackError.missingScalesCompanion(name: name)
                 }
-                guard let biases = registry[base + ".biases"] else {
+                guard let biases = override?.biases ?? registry[base + ".biases"] else {
                     throw RepackError.missingBiasesCompanion(name: name)
                 }
                 if scales.dtype != .bf16 || biases.dtype != .bf16 {
                     throw RepackError.dtypeMismatch(name: name,
                         detail: "expected BF16 scales/biases, got \(scales.dtype)/\(biases.dtype)")
                 }
-                let spec = IndexLoader.quantSpec(forTensor: name, meta: meta)
+                let spec = override?.quantSpec
+                    ?? IndexLoader.quantSpec(forTensor: name, meta: meta)
                 let logical = logicalShape(forPackedSource: weight.shape, bits: spec.bits)
 
                 let wOff = fileCursor

@@ -12,6 +12,7 @@ struct RemoteSnapshot {
 enum RemoteSnapshotLoader {
     static func load(remote: HuggingFaceRemoteSource,
                      requireKnownSource: Bool,
+                     expectedIndexSHA256: String? = nil,
                      metadataDirectory: String,
                      audit: RepackAudit? = nil) async throws -> RemoteSnapshot {
         try Posix.mkdirP(metadataDirectory)
@@ -39,6 +40,12 @@ enum RemoteSnapshotLoader {
                                         audit: audit)
 
         let metadata = try IndexLoader.load(snapshotDir: metadataDirectory)
+        if let expectedIndexSHA256,
+           metadata.indexSha256Hex != expectedIndexSHA256 {
+            throw RepackError.sourceFingerprintRejected(
+                path: metadata.indexPath,
+                sha256: metadata.indexSha256Hex)
+        }
         if requireKnownSource && SourceFingerprint.modelID(forIndexSha256: metadata.indexSha256Hex) == nil {
             throw RepackError.sourceFingerprintRejected(path: metadata.indexPath,
                                                         sha256: metadata.indexSha256Hex)

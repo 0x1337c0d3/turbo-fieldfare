@@ -22,7 +22,7 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         guard let url = request.url,
-              let filename = Self.filename(from: url) else {
+              let (repoID, filename) = Self.repoAndFilename(from: url) else {
             let response = HTTPURLResponse(url: request.url!,
                                            statusCode: 404,
                                            httpVersion: nil,
@@ -64,7 +64,8 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
             break
         }
 
-        guard let data = Self.files[filename] else {
+        let qualified = repoID + "::" + filename
+        guard let data = Self.files[qualified] ?? Self.files[filename] else {
             let response = HTTPURLResponse(url: request.url!,
                                            statusCode: 404,
                                            httpVersion: nil,
@@ -138,12 +139,19 @@ final class FakeHFURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static func filename(from url: URL) -> String? {
+        repoAndFilename(from: url)?.filename
+    }
+
+    static func repoAndFilename(from url: URL) -> (repoID: String, filename: String)? {
         let parts = url.path.split(separator: "/").map(String.init)
         guard let resolveIndex = parts.firstIndex(of: "resolve"),
+              resolveIndex >= 2,
               parts.count > resolveIndex + 2 else {
             return nil
         }
-        return parts[(resolveIndex + 2)...].joined(separator: "/")
+        return (
+            parts[(resolveIndex - 2)..<resolveIndex].joined(separator: "/"),
+            parts[(resolveIndex + 2)...].joined(separator: "/"))
     }
 
     static func nextFailure(for key: String) -> FakeFailure? {

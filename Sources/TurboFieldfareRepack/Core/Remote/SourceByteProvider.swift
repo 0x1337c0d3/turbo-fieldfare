@@ -16,13 +16,16 @@ public protocol SourceByteProvider {
 public final class HTTPRangeSourceByteProvider: SourceByteProvider {
     private let remote: HuggingFaceRemoteSource
     private let files: [String: RemoteFileInfo]
+    private let filenames: [String: String]
     private let writeTileBytes: Int
 
     public init(remote: HuggingFaceRemoteSource,
                 files: [String: RemoteFileInfo],
+                filenames: [String: String] = [:],
                 writeTileBytes: Int = WriterCore.tileBytes) {
         self.remote = remote
         self.files = files
+        self.filenames = filenames
         self.writeTileBytes = writeTileBytes
     }
 
@@ -56,7 +59,7 @@ public final class HTTPRangeSourceByteProvider: SourceByteProvider {
             }
             let base = downloaded
             let temporary = try await remote.downloadRangeToTempFile(
-                filename: copy.shardID,
+                filename: filenames[copy.shardID] ?? copy.shardID,
                 info: info,
                 offset: copy.sourceOffset,
                 length: Int(copy.size),

@@ -1015,6 +1015,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                                     onEvent(.content(visible))
                                 }
                                 if stopMatcher.isStopped { shouldStop = true }
+                            case .thought:
+                                break
                             case .toolCall(let call):
                                 calls.append(call)
                                 onEvent(.toolCall(call))

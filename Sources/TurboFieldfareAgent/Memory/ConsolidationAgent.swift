@@ -44,7 +44,7 @@ enum ConsolidationAgent {
         )
         
         // Use the shared conversation run loop
-        let summary = try await AgentTurn.run(runtime: runtime, messages: &messages, context: context, resultLimit: 200)
+        let summary = try await AgentTurn.run(runtime: runtime, messages: &messages, context: context, resultLimit: 200, forceLocal: true)
         
         return summary
     }

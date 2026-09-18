@@ -1,101 +1,83 @@
 ---
 name: review
-description: Review a pull request or pending changes. Performs a focused code review against the current branch's diff (or staged diff if invoked pre-commit), surfacing correctness bugs, missing tests, style violations, and unclear naming. Use when the user asks to "review this", "review the PR", "code review", or before commits/PRs.
+description: Review a TurboFieldfare pull request or pending Swift and Metal changes for correctness, regressions, tests, and project-specific safety constraints.
 ---
 
 # Code Review Skill
 
-You are conducting a focused code review. Your goal is to surface real issues a reviewer should catch — not produce a generic summary.
+Conduct a focused review that surfaces actionable defects rather than a change
+summary.
 
-## Step 1 — Determine review scope
+## Scope and context
 
-Pick the diff source in this order:
+Choose the diff in this order: a user-named PR (`gh pr view` and `gh pr diff`),
+staged changes, then the current branch against its merge base with `main`.
+State the scope. Read every changed file in full, `AGENTS.md`, relevant tests,
+and directly relevant format/runtime/server documentation.
 
-1. If the user names a PR (e.g. "review PR 42"), fetch it with `gh pr view <n> --json ...` + `gh pr diff <n>`.
-2. If staged changes exist (`git diff --cached --name-only` is non-empty), review the staged diff. Announce: "Reviewing staged changes."
-3. Otherwise, review the current branch vs `main`:
-   ```bash
-   base=$(git merge-base HEAD main)
-   git diff "$base"...HEAD
-   ```
+## Review focus
 
-State the scope in one sentence before going deeper.
+**Swift correctness and concurrency**
 
-## Step 2 — Gather context
+- Off-by-one errors, invalid shape/stride math, unchecked narrowing, overflow,
+  and out-of-bounds collection or raw-buffer access.
+- `try!`, force unwraps, force casts, and `precondition` on input-controlled
+  paths without a proved invariant.
+- Actor-isolation violations, non-`Sendable` state crossing tasks, continuations
+  resumed incorrectly, cancellation races, and locks held across suspension.
+- Escaping pointers from `withUnsafe*`, mismatched allocation/deallocation,
+  use-after-free with `Data(bytesNoCopy:)` or Metal buffers, and FFI ownership
+  errors.
+- Resource lifetime mistakes involving mapped files, file descriptors, tasks,
+  NIO channels, command buffers, or retained KV state.
 
-- List changed files (`git diff --name-only <range>`).
-- Read each changed file (the **whole file**, not just the hunks) so you understand the context surrounding each change.
-- Read any `AGENTS.md` files in the repo to learn project conventions.
-- If tests exist for changed modules, scan them so you know what's already covered.
+**Metal and inference**
 
-## Step 3 — Review
+- Dispatch geometry that can access past a buffer, host/shader layout mismatch,
+  missing synchronization, incorrect storage mode assumptions, and unsupported
+  dtype/shape combinations.
+- Silent changes to sampling defaults, prompt rendering, context accounting,
+  expert cache behaviour, image/text separation, or `.gturbo` v1 compatibility.
+- Image failures that fall back to text-only behaviour instead of failing
+  closed.
 
-For each changed file, look for:
+**Tests and public behaviour**
 
-**Correctness**
-- Off-by-one errors, wrong operator, swapped arguments
-- Unhandled `Result`/`Option` — `.unwrap()` or `.expect()` in production paths (non-main)
-- Resource leaks (file handles, sockets, locks not released — check `Drop` impls)
-- Race conditions: `Arc<Mutex<_>>` held across `.await`, shared mutable state
-- Integer overflow in release mode (unchecked arithmetic on user-supplied values)
-- Wrong return type or shape vs. what callers expect
-- `unsafe` blocks without a `// SAFETY:` comment, or with a comment that doesn't hold
+- New behaviour without a focused Swift Testing/XCTest case, especially error,
+  cancellation, empty input, boundary sizes, and malformed pack/server input.
+- Accidental real-model dependence where a deterministic model-free fixture or
+  reference implementation would suffice.
+- Server behaviour that diverges from `docs/OPENAI_SERVER.md` or binds beyond
+  `127.0.0.1`.
 
-**Tests**
-- New behaviour without a corresponding test
-- Tests that assert on incidental output rather than behaviour
-- Tests that call `.unwrap()` without explanation — they'll panic silently on CI
-- Missing edge cases: empty input, overflow boundaries, error paths
+**Clarity and scope**
 
-**Security (lightweight — defer deep work to `/security-review`)**
-- `std::process::Command` built from user input without sanitisation
-- `unsafe` that dereferences raw pointers from untrusted sources
-- Secrets in code or logs
-- Missing input validation at trust boundaries (CLI args, env vars, network input)
+- Misleading names, stale comments, dead code, unjustified diagnostic
+  suppressions, `fatalError`/`TODO` in reachable production paths, and
+  speculative abstraction.
+- Unrelated refactors or unintended changes to `Package.resolved`, generated
+  files, model packs, `scratch/`, runtime defaults, or experimental controls.
 
-**Style & clarity**
-- Names that don't match what the thing does
-- Comments that say WHAT (delete) vs WHY (keep if non-obvious)
-- Dead code, unused imports, `#[allow(...)]` without justification
-- Over-engineering: speculative abstractions, premature generics, error handling for impossible cases
-- Violations of project conventions (check `AGENTS.md`)
-- `todo!()` / `unimplemented!()` left in production paths
+Defer a deep vulnerability analysis to `/security-review`, but report concrete
+security bugs found during ordinary review.
 
-**Scope**
-- Changes outside the stated purpose of the PR (unrelated refactors mixed in)
-- Half-finished work, `// TODO` added without tickets
-- `Cargo.lock` changes that weren't intentional
+## Report
 
-## Step 4 — Report
+Use `file:line` references and only headings that have content:
 
-Output format — **be terse**:
-
-```
-## Review: <one-line scope>
+```markdown
+## Review: <scope>
 
 ### Blocking
-- `path/to/file.rs:42` — <issue>. <one-line fix suggestion>
+- `path/File.swift:42` — <correctness or security defect and concise fix>
 
 ### Should fix
-- `path/to/file.rs:88` — <issue>.
+- `path/File.swift:88` — <material maintainability or test gap>
 
 ### Nits
-- `path/to/file.rs:12` — <issue>.
-
-### Looks good
-<1-2 sentences on what's solid — only if there's something genuinely worth calling out>
+- `path/File.swift:12` — <minor issue>
 ```
 
-Rules:
-- Use `file:line` references so the user can jump to the source.
-- "Blocking" = correctness or security bug; do not block on style.
-- If there's nothing in a category, omit the heading entirely.
-- If the diff is clean, say so in one sentence. Don't pad.
-- Do NOT summarise what the PR does — the user wrote it and can read the diff.
-
-## Step 5 — If invoked from `/commit` or `/implement`
-
-When the caller is another slash command (not the user directly), it may auto-apply your suggestions. In that case:
-
-- Be explicit about which findings are mechanical fixes (formatter, rename, delete dead code) vs. judgement calls that need user input.
-- Tag judgement calls with `[needs-decision]` so the caller knows to surface them rather than silently auto-apply.
+Do not block on style. If clean, say so plainly. When called by `/commit` or
+`/implement`, distinguish mechanical fixes and tag judgment calls
+`[needs-decision]`.

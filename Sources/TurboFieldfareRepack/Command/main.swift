@@ -4,6 +4,7 @@ import TurboFieldfareRepackCore
 private let usage = """
 Usage:
   TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+                       [--shared-expert-8bit]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --vision-output <model.vision.gturbo>
@@ -42,6 +43,7 @@ private struct Arguments {
     var verifyVisionInstall = false
     var activateVisionInstall = false
     var removeVisionInstall = false
+    var sharedExpert8Bit = false
 
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
@@ -71,6 +73,9 @@ private struct Arguments {
                 index += 1
             case "--remove-vision-install":
                 parsed.removeVisionInstall = true
+                index += 1
+            case "--shared-expert-8bit":
+                parsed.sharedExpert8Bit = true
                 index += 1
             case "--vision-output":
                 guard index + 1 < values.count else {
@@ -110,7 +115,7 @@ private struct Arguments {
                 throw ParseError.missingRequired("--vision-output")
             }
             guard parsed.output == nil, parsed.inputGTurbo == nil,
-                  !parsed.verifyInstall else {
+                  !parsed.verifyInstall, !parsed.sharedExpert8Bit else {
                 throw ParseError.invalidMode(
                     "vision install operations do not accept text install arguments")
             }
@@ -155,7 +160,8 @@ private struct Arguments {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  !parsed.sharedExpert8Bit else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -164,7 +170,8 @@ private struct Arguments {
             guard parsed.inputGTurbo != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
             }
-            guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
+            guard parsed.output == nil, !parsed.overwrite, !parsed.resume,
+                  !parsed.sharedExpert8Bit else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
         } else {
@@ -326,12 +333,14 @@ private func run(_ values: [String]) async -> Int32 {
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
-        resume: arguments.resume)
+        resume: arguments.resume,
+        sharedExpert8Bit: arguments.sharedExpert8Bit)
     do {
         let progress = InstallProgressReporter()
         let result = try await RemoteStreamingRepacker(options: options).run(
             progress: { progress($0) })
-        print("Installed \(SupportedModelSource.displayName)")
+        let precision = arguments.sharedExpert8Bit ? " with 8-bit shared experts" : ""
+        print("Installed \(SupportedModelSource.displayName)\(precision)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

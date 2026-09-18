@@ -5,6 +5,63 @@ import Testing
 
 @Suite
 struct RangeCopyPlannerTests {
+    @Test func sharedExpertOverridesReplaceOnlySharedResidentWeights() throws {
+        let primaryDirectory = temporaryRoot("primary-4bit")
+        let auxiliaryDirectory = temporaryRoot("shared-8bit")
+        let output = temporaryRoot("hybrid-output")
+        defer {
+            try? FileManager.default.removeItem(atPath: primaryDirectory)
+            try? FileManager.default.removeItem(atPath: auxiliaryDirectory)
+            try? FileManager.default.removeItem(atPath: output)
+        }
+        let primary = try SyntheticSnapshot.build(
+            at: primaryDirectory, seed: 0x1111, sharedExpertBits: 4)
+        let auxiliary = try SyntheticSnapshot.build(
+            at: auxiliaryDirectory, seed: 0x2222, sharedExpertBits: 8)
+        let primaryMetadata = try IndexLoader.load(snapshotDir: primaryDirectory)
+        let auxiliaryMetadata = try IndexLoader.load(snapshotDir: auxiliaryDirectory)
+        let arch = try ArchInfo.load(configPath:
+            (primaryDirectory as NSString).appendingPathComponent("config.json"))
+        let overrides = try RepackPlanner.sharedExpertOverrides(
+            meta: auxiliaryMetadata,
+            arch: arch,
+            shardHeaders: [try parseHeader(path: auxiliary.shardPath)],
+            sourceNamespace: "shared8")
+        let plan = try RepackPlanner.plan(
+            meta: primaryMetadata,
+            arch: arch,
+            shardHeaders: [try parseHeader(path: primary.shardPath)],
+            outputDir: output,
+            sharedExpertOverrides: overrides)
+
+        let shared = plan.resident.entries.filter { $0.name.contains(".mlp.") }
+        let otherQuantized = plan.resident.entries.filter {
+            $0.quantSpec != nil && !$0.name.contains(".mlp.")
+        }
+        #expect(shared.count == arch.numLayers * 3)
+        #expect(shared.allSatisfy { $0.quantSpec?.bits == 8 })
+        #expect(shared.allSatisfy { $0.sourceWeight.shardPath.hasPrefix("shared8/") })
+        #expect(otherQuantized.allSatisfy { !$0.sourceWeight.shardPath.hasPrefix("shared8/") })
+    }
+
+    @Test func sharedExpertOverridesRequireGenuineEightBitWeights() throws {
+        let directory = temporaryRoot("invalid-shared-override")
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let snapshot = try SyntheticSnapshot.build(
+            at: directory, seed: 0x3333, sharedExpertBits: 4)
+        let metadata = try IndexLoader.load(snapshotDir: directory)
+        let arch = try ArchInfo.load(configPath:
+            (directory as NSString).appendingPathComponent("config.json"))
+
+        #expect(throws: RepackError.self) {
+            _ = try RepackPlanner.sharedExpertOverrides(
+                meta: metadata,
+                arch: arch,
+                shardHeaders: [try parseHeader(path: snapshot.shardPath)],
+                sourceNamespace: "shared8")
+        }
+    }
+
     @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() throws {
         let snapshotDirectory = temporaryRoot("snapshot")
         let firstOutput = temporaryRoot("first")

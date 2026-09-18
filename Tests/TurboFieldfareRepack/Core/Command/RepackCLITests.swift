@@ -3,6 +3,22 @@ import Testing
 
 @Suite(.serialized)
 struct RepackCLITests {
+    @Test func helpAdvertisesEightBitSharedExpertExperiment() throws {
+        let result = try run(["--help"])
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("--shared-expert-8bit"))
+    }
+
+    @Test func sharedExpertExperimentIsRejectedForNonInstallModes() throws {
+        let output = temporaryOutput("shared8-invalid-mode")
+        defer { clean(output) }
+        let result = try run([
+            "--discard-partial", "--output", output, "--shared-expert-8bit",
+        ])
+        #expect(result.status == 2)
+        #expect(result.stderr.contains("only accepts --output"))
+    }
+
     @Test func resumeAndDiscardAreMutuallyExclusive() throws {
         let output = temporaryOutput("exclusive")
         defer { clean(output) }

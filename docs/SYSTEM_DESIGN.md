@@ -118,7 +118,11 @@ buffer per tensor.
 The current production manifest describes the model's group-64 affine
 quantization: 4-bit embedding and attention weights, an 8-bit router, and
 4-bit shared and routed experts. Missing or incompatible quantization metadata
-is rejected.
+is rejected. The opt-in `--shared-expert-8bit` installer mode replaces only the
+90 resident shared-expert matrices with group-64 affine 8-bit tensors from a
+separately pinned snapshot. Its manifest records 8-bit shared experts and a
+combined source fingerprint; routed-expert files and their streaming path are
+unchanged.
 
 `manifest.json` marks the installation as complete and defines what the runtime
 may load. It records the architecture, file sizes, and SHA-256 hashes. Without

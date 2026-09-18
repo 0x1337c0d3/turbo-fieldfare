@@ -1,97 +1,55 @@
 ---
 name: commit
-description: Pre-commit gate (fmt + clippy + test) then create a conventional commit with explicit file staging.
+description: Run TurboFieldfare's Swift formatting, release-build, serial-test, and repository checks, then create a conventional commit with explicit staging.
 ---
 
 # /commit
 
-The enforcer. Nothing reaches the index without passing the gate.
+Create a commit only after the intended change passes the repository's local
+gates. Preserve unrelated user changes in a dirty worktree.
 
-## Steps
+## Gates
 
-### 1. Format check
+1. Enumerate staged, unstaged, and untracked files with `git status --short`.
+   Establish exactly which files belong to this commit.
+2. For intended `*.swift` files and `Package.swift`, run:
 
-```bash
-cargo fmt -- --check
-```
+   ```bash
+   swift format lint --strict <files...>
+   git diff --check
+   ```
 
-If dirty: run `/fmt` to apply formatting, then re-stage any files that were already staged.
+   If formatting fails, run `/fmt`, then re-stage only intended files.
+3. Match the compile and package-test gates used by the project:
 
-### 2. Clippy
+   ```bash
+   swift build -c release
+   Scripts/test.sh
+   ruby Scripts/check_tracked_symlinks.rb
+   ruby Scripts/check_markdown_links.rb
+   ruby Scripts/check_app_version.rb
+   ```
 
-```bash
-cargo clippy --all-features --all-targets -- -D warnings
-```
+   The app-version check may report that GitHub is unavailable and skip its
+   comparison; disclose that as a CI-parity gap. Do not substitute a direct or
+   parallel `swift test`, and do not invent a coverage gate. Apply the full
+   `AGENTS.md` preflight whenever the selected suite can use an installed real
+   model.
+4. Run `/review` against the staged changes. Apply mechanical fixes, re-stage,
+   and repeat the gates. Surface `[needs-decision]` findings. Stop after two
+   repair loops and ask the user how to proceed.
 
-If any warnings/errors are reported: fix them. **Do not add `#[allow(clippy::...)]` suppression** unless the lint is a confirmed false positive — and even then, add a comment explaining why. Re-run clippy until it exits 0.
+## Stage and commit
 
-### 3. Full test run
+Stage each intended path explicitly with `git add <path>...`; never use
+`git add .` or `git add -A`. Treat unexpected `Package.resolved`, model files,
+`scratch/`, generated build output, or unrelated changes as blockers until the
+user confirms their intent.
 
-Run `/test`. **Must pass, including the coverage gate.** If it fails: halt. Surface the failure and let the user decide.
+Use a conventional commit subject (`feat`, `fix`, `chore`, `test`, `docs`,
+`refactor`, `perf`, `style`, `build`, or `ci`) in imperative mood, at most 72
+characters. Explain why in an optional wrapped body. Do not add emoji or a
+hard-coded co-author trailer.
 
-### 4. Review
-
-Run `/review` against staged changes (`git diff --cached`).
-
-> The `/review` skill is diff-aware — it picks up staged changes automatically when invoked here.
-
-Handle findings:
-
-- Mechanical fixes (Blocking / Should fix without `[needs-decision]`): apply, re-stage the file, then re-run `/test`.
-- `[needs-decision]` findings: surface to the user. Do not silently apply.
-- Nits: mention in the report, do not block on them.
-
-If any fix was applied: loop back to step 1. Max 2 loops, then escalate.
-
-### 5. Stage files explicitly
-
-```bash
-git add <file1> <file2> ...
-```
-
-**Never `git add -A` or `git add .`.** These are denied at the settings level — if Claude tries them, the call will be rejected.
-
-Use `git status --short` to enumerate what's intended for the commit. If something unintended shows up (e.g. `Cargo.lock` changes you didn't intend), ask the user.
-
-### 6. Compose the commit message
-
-Format: conventional commits.
-
-```
-<type>(<scope>): <short imperative description>
-
-<optional body — wrap at 72 cols, explain the WHY, not the WHAT>
-```
-
-Types: `feat`, `fix`, `chore`, `test`, `docs`, `refactor`, `perf`, `style`, `build`, `ci`.
-
-Rules:
-
-- **Imperative mood** ("add parser", not "adds parser" or "added parser").
-- **Short subject** (≤ 72 chars). Detail goes in the body.
-- **No emoji.**
-- **No hardcoded `Co-Authored-By` line.**
-
-### 7. Commit
-
-```bash
-git commit -m "$(cat <<'EOF'
-<message>
-EOF
-)"
-```
-
-Use a heredoc so multi-line bodies format correctly.
-
-### 8. Confirm
-
-```bash
-git log -1 --oneline
-git status --short
-```
-
-Report: commit hash, subject line, working-tree state. One line each, no padding.
-
-## Pre-commit hook failure
-
-If a pre-commit hook fails: the commit did **not** happen. Fix the underlying issue, re-stage, and create a **new** commit. Never `--amend` after a hook failure — there's nothing to amend.
+After `git commit`, report `git log -1 --oneline` and `git status --short`. If a
+hook fails, fix and retry as a new commit attempt; there is no commit to amend.

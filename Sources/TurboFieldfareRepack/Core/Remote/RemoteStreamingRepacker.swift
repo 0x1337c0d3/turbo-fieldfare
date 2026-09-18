@@ -1,4 +1,22 @@
 import Foundation
+
+public struct RemoteSupplementalSource: Sendable, Equatable {
+    public let repoID: String
+    public let revision: String
+    public let sourceIndexSHA256: String
+    public let namespace: String
+
+    public init(repoID: String,
+                revision: String,
+                sourceIndexSHA256: String,
+                namespace: String) {
+        self.repoID = repoID
+        self.revision = revision
+        self.sourceIndexSHA256 = sourceIndexSHA256
+        self.namespace = namespace
+    }
+}
+
 public struct RemoteStreamingRepackOptions: Sendable {
     public let repoID: String
     public let revision: String
@@ -16,6 +34,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let baseURL: URL
     public let rangeRetryAttempts: Int
     public let retryBaseDelayNs: UInt64
+    public let sharedExpertSource: RemoteSupplementalSource?
 
     public init(repoID: String,
                 revision: String,
@@ -32,7 +51,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
                 baseURL: URL = URL(string: "https://huggingface.co")!,
                 rangeRetryAttempts: Int = 4,
-                retryBaseDelayNs: UInt64 = 1_000_000_000) {
+                retryBaseDelayNs: UInt64 = 1_000_000_000,
+                sharedExpertSource: RemoteSupplementalSource? = nil) {
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
@@ -49,6 +69,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
         self.baseURL = baseURL
         self.rangeRetryAttempts = rangeRetryAttempts
         self.retryBaseDelayNs = retryBaseDelayNs
+        self.sharedExpertSource = sharedExpertSource
     }
 }
 
@@ -184,14 +205,54 @@ public final class RemoteStreamingRepacker {
                                                            metadataDirectory: paths.metadataDirectory,
                                                            audit: audit)
         try Task.checkCancellation()
+        var auxiliarySnapshot: RemoteSnapshot?
+        var auxiliaryRemote: HuggingFaceRemoteSource?
+        var sharedExpertOverrides: SharedExpertOverrides?
+        if let source = options.sharedExpertSource {
+            let supplementalRemote = HuggingFaceRemoteSource(
+                repoID: source.repoID,
+                requestedRevision: source.revision,
+                resolvedCommit: source.revision,
+                token: options.token,
+                downloadSession: options.downloadSession,
+                baseURL: options.baseURL,
+                tempDirectory: paths.partialDirectory,
+                retryPolicy: retryPolicy)
+            let supplementalSnapshot = try await RemoteSnapshotLoader.load(
+                remote: supplementalRemote,
+                requireKnownSource: false,
+                expectedIndexSHA256: source.sourceIndexSHA256,
+                metadataDirectory: (paths.metadataDirectory as NSString)
+                    .appendingPathComponent(source.namespace),
+                audit: audit)
+            guard supplementalSnapshot.resolvedCommit == source.revision,
+                  supplementalSnapshot.arch == snapshot.arch else {
+                throw RepackError.configurationInvalid(
+                    detail: "8-bit shared-expert source does not match the primary architecture")
+            }
+            sharedExpertOverrides = try RepackPlanner.sharedExpertOverrides(
+                meta: supplementalSnapshot.metadata,
+                arch: snapshot.arch,
+                shardHeaders: supplementalSnapshot.shardHeaders,
+                sourceNamespace: source.namespace)
+            auxiliarySnapshot = supplementalSnapshot
+            auxiliaryRemote = supplementalRemote
+        }
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
                                           shardHeaders: snapshot.shardHeaders,
-                                          outputDir: paths.partialDirectory)
+                                          outputDir: paths.partialDirectory,
+                                          sharedExpertOverrides: sharedExpertOverrides)
+        let sourceIdentity = sourceIdentityHash(
+            primary: snapshot,
+            supplemental: auxiliarySnapshot,
+            supplementalSource: options.sharedExpertSource)
         let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
                                                   rangeChunkBytes: options.rangeChunkBytes,
-                                                  layoutMode: "identity",
-                                                  layoutOrderSha256: nil)
+                                                  layoutMode: auxiliarySnapshot == nil
+                                                    ? "identity"
+                                                    : "shared-expert-8bit",
+                                                  layoutOrderSha256: sourceIdentity)
         var checkpoint = saved ?? RemoteInstallCheckpoint(
             repoID: options.repoID,
             requestedRevision: options.revision,
@@ -278,9 +339,6 @@ public final class RemoteStreamingRepacker {
                 parentDirectory: paths.parentDirectory)
         }
 
-        let provider = HTTPRangeSourceByteProvider(remote: remote.pinned(commit: snapshot.resolvedCommit),
-                                                   files: snapshot.remoteFiles,
-                                                   writeTileBytes: options.writeTileBytes)
         let reusedBytes = checkpoint.completedRanges.reduce(UInt64(0)) {
             $0 + $1.sourceBytes
         }
@@ -289,26 +347,73 @@ public final class RemoteStreamingRepacker {
             reusedBytes: reusedBytes,
             downloadedThisRunBytes: 0,
             totalBytes: rangePlan.remoteBytesToDownload))
-        try await provider.copyBatch(
-            rangePlan.coalescedCopies,
-            completedRangeIDs: Set(checkpoint.completedRanges.map(\.id)),
-            partialDirectory: paths.partialDirectory,
-            temporaryPath: paths.rangeTemporaryFile,
-            audit: audit,
-            progress: { downloadedBytes in
-                progress(.copyingPayload(
-                    reusedBytes: reusedBytes,
-                    downloadedThisRunBytes: downloadedBytes,
-                    totalBytes: rangePlan.remoteBytesToDownload))
-            },
-            commit: { completed in
-                checkpoint.completedRanges.removeAll { $0.id == completed.id }
-                checkpoint.completedRanges.append(completed)
-                checkpoint.completedRanges.sort { $0.id < $1.id }
-                try checkpoint.write(
-                    to: paths.checkpointFile,
-                    parentDirectory: paths.parentDirectory)
-            })
+        let completedAtStart = Set(checkpoint.completedRanges.map(\.id))
+        var downloadedAcrossSources: UInt64 = 0
+        func copy(
+            _ copies: [CoalescedRangeCopy],
+            provider: HTTPRangeSourceByteProvider
+        ) async throws {
+            let base = downloadedAcrossSources
+            try await provider.copyBatch(
+                copies,
+                completedRangeIDs: completedAtStart,
+                partialDirectory: paths.partialDirectory,
+                temporaryPath: paths.rangeTemporaryFile,
+                audit: audit,
+                progress: { downloadedBytes in
+                    progress(.copyingPayload(
+                        reusedBytes: reusedBytes,
+                        downloadedThisRunBytes: base + downloadedBytes,
+                        totalBytes: rangePlan.remoteBytesToDownload))
+                },
+                commit: { completed in
+                    checkpoint.completedRanges.removeAll { $0.id == completed.id }
+                    checkpoint.completedRanges.append(completed)
+                    checkpoint.completedRanges.sort { $0.id < $1.id }
+                    try checkpoint.write(
+                        to: paths.checkpointFile,
+                        parentDirectory: paths.parentDirectory)
+                })
+            downloadedAcrossSources = base + copies
+                .filter { !completedAtStart.contains($0.id) }
+                .reduce(UInt64(0)) { $0 + $1.size }
+        }
+
+        if let source = options.sharedExpertSource,
+           let supplementalSnapshot = auxiliarySnapshot,
+           let supplementalRemote = auxiliaryRemote {
+            let prefix = source.namespace + "/"
+            let primaryCopies = rangePlan.coalescedCopies.filter {
+                !$0.shardID.hasPrefix(prefix)
+            }
+            let supplementalCopies = rangePlan.coalescedCopies.filter {
+                $0.shardID.hasPrefix(prefix)
+            }
+            try await copy(
+                primaryCopies,
+                provider: HTTPRangeSourceByteProvider(
+                    remote: remote.pinned(commit: snapshot.resolvedCommit),
+                    files: snapshot.remoteFiles,
+                    writeTileBytes: options.writeTileBytes))
+            let files = Dictionary(uniqueKeysWithValues:
+                supplementalSnapshot.remoteFiles.map { (prefix + $0.key, $0.value) })
+            let filenames = Dictionary(uniqueKeysWithValues:
+                supplementalSnapshot.remoteFiles.keys.map { (prefix + $0, $0) })
+            try await copy(
+                supplementalCopies,
+                provider: HTTPRangeSourceByteProvider(
+                    remote: supplementalRemote,
+                    files: files,
+                    filenames: filenames,
+                    writeTileBytes: options.writeTileBytes))
+        } else {
+            try await copy(
+                rangePlan.coalescedCopies,
+                provider: HTTPRangeSourceByteProvider(
+                    remote: remote.pinned(commit: snapshot.resolvedCommit),
+                    files: snapshot.remoteFiles,
+                    writeTileBytes: options.writeTileBytes))
+        }
 
         try recordOutputFile(relativePath: "model_weights.bin",
                              path: plan.resident.path,
@@ -343,7 +448,9 @@ public final class RemoteStreamingRepacker {
                           partialDir: paths.partialDirectory,
                           metadata: snapshot.metadata,
                           expertStride: expertStride,
-                          resolvedCommit: snapshot.resolvedCommit)
+                          resolvedCommit: snapshot.resolvedCommit,
+                          sourceIdentityHash: sourceIdentity,
+                          supplementalSnapshot: auxiliarySnapshot)
 
         try Task.checkCancellation()
         if try Posix.entryKind(paths.finalDirectory) == .directory {
@@ -389,6 +496,16 @@ public final class RemoteStreamingRepacker {
         guard options.rangeRetryAttempts >= 0 else {
             throw RepackError.configurationInvalid(detail:
                 "bad range retry attempts \(options.rangeRetryAttempts)")
+        }
+        if let source = options.sharedExpertSource {
+            guard !source.repoID.isEmpty,
+                  source.revision.count == 40,
+                  source.sourceIndexSHA256.count == 64,
+                  !source.namespace.isEmpty,
+                  !source.namespace.contains("/") else {
+                throw RepackError.configurationInvalid(
+                    detail: "invalid 8-bit shared-expert source identity")
+            }
         }
     }
 
@@ -559,11 +676,37 @@ public final class RemoteStreamingRepacker {
         return false
     }
 
+    private func sourceIdentityHash(
+        primary: RemoteSnapshot,
+        supplemental: RemoteSnapshot?,
+        supplementalSource: RemoteSupplementalSource?
+    ) -> String? {
+        guard let supplemental, let supplementalSource else { return nil }
+        var stream = Sha256Stream()
+        for value in [
+            "TurboFieldfare.SharedExpert8BitSource.v1",
+            options.repoID,
+            primary.resolvedCommit,
+            primary.metadata.indexSha256Hex,
+            supplementalSource.repoID,
+            supplemental.resolvedCommit,
+            supplemental.metadata.indexSha256Hex,
+        ] {
+            let data = Data(value.utf8)
+            var count = UInt64(data.count).littleEndian
+            withUnsafeBytes(of: &count) { stream.update($0) }
+            data.withUnsafeBytes { stream.update($0) }
+        }
+        return stream.finalizeHexString()
+    }
+
     private func writeManifest(plan: RepackPlan,
                                partialDir: String,
                                metadata: IndexLoader.SourceMetadata,
                                expertStride: UInt64,
-                               resolvedCommit: String) throws {
+                               resolvedCommit: String,
+                               sourceIdentityHash: String?,
+                               supplementalSnapshot: RemoteSnapshot?) throws {
         var bits = GTurboJSON.QuantBitWidths(
             embedding: 4,
             attention: 4,
@@ -593,8 +736,11 @@ public final class RemoteStreamingRepacker {
         }
         let data = try GTurboJSON.encodeManifest(
             plan: plan,
-            modelID: plan.matchedModelID ?? "unknown/snapshot",
-            sourceSnapshotHash: "sha256:" + metadata.indexSha256Hex,
+            modelID: supplementalSnapshot == nil
+                ? (plan.matchedModelID ?? "unknown/snapshot")
+                : "turbofieldfare/gemma-4-26b-a4b-it-4bit-shared8",
+            sourceSnapshotHash: "sha256:"
+                + (sourceIdentityHash ?? metadata.indexSha256Hex),
             files: files,
             expertsPerLayer: plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertsPerLayer ?? 0,
             numLayers: plan.arch.numLayers,
@@ -611,6 +757,22 @@ public final class RemoteStreamingRepacker {
             manifestSize: UInt64(data.count),
             sourceRepoID: options.repoID,
             sourceRevision: resolvedCommit,
+            sourceComponents: options.sharedExpertSource.flatMap { source in
+                supplementalSnapshot.map { supplemental in
+                    [
+                        .init(
+                            role: "primary",
+                            repoID: options.repoID,
+                            revision: resolvedCommit,
+                            indexSHA256: metadata.indexSha256Hex),
+                        .init(
+                            role: "sharedExpert",
+                            repoID: source.repoID,
+                            revision: supplemental.resolvedCommit,
+                            indexSHA256: supplemental.metadata.indexSha256Hex),
+                    ]
+                }
+            } ?? [],
             files: audit.outputFiles)
         let receiptPath = (partialDir as NSString)
             .appendingPathComponent(VerifiedInstallReceiptWriter.fileName)

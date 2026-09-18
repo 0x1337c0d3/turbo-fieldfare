@@ -9,11 +9,17 @@ public enum SupportedModelSource {
     public static let approximateDownloadBytes: UInt64 = 14_620_479_420
     public static let installedBytes: UInt64 = 14_291_921_884
     public static let reserveBytes: UInt64 = 1_073_741_824
+    public static let sharedExpert8BitSource = RemoteSupplementalSource(
+        repoID: "mlx-community/gemma-4-26b-a4b-it-8bit",
+        revision: "33c6d23798a0af159529890f79329206dbfbd73c",
+        sourceIndexSHA256: "4b96ec862d7ae3f8d150b22b295cefcc9b5ef5e83f172f530dc1f2d2c11339cc",
+        namespace: "shared8")
 
     public static func installOptions(outputDirectory: URL,
                                       overwrite: Bool,
                                       token: String?,
-                                      resume: Bool = false)
+                                      resume: Bool = false,
+                                      sharedExpert8Bit: Bool = false)
         -> RemoteStreamingRepackOptions {
         RemoteStreamingRepackOptions(
             repoID: repoID,
@@ -23,6 +29,7 @@ public enum SupportedModelSource {
             requireKnownSource: true,
             minFreeReserveBytes: reserveBytes,
             overwrite: overwrite,
-            resume: resume)
+            resume: resume,
+            sharedExpertSource: sharedExpert8Bit ? sharedExpert8BitSource : nil)
     }
 }

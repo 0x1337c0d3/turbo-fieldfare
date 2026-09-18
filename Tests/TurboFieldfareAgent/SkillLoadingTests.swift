@@ -4,6 +4,34 @@ import TurboFieldfare
 @testable import TurboFieldfareAgent
 
 final class SkillLoadingTests: XCTestCase, @unchecked Sendable {
+    func testCustomSystemPromptReplacesDefaultPrompts() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home")
+        let project = root.appendingPathComponent("project")
+        let customPrompt = root.appendingPathComponent("custom-prompt.md")
+        func write(_ text: String, _ path: URL) throws {
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try text.write(to: path, atomically: true, encoding: .utf8)
+        }
+        try write("HOME_DEFAULT", home.appendingPathComponent(".agents/codex_prompt.md"))
+        try write("PROJECT_DEFAULT", project.appendingPathComponent(".agents/codex_prompt.md"))
+        try write("PROJECT_GUIDANCE", project.appendingPathComponent("AGENTS.md"))
+        try write("CUSTOM_SYSTEM_PROMPT", customPrompt)
+
+        let config = try AgentConfig(
+            arguments: ["--system-prompt", customPrompt.path],
+            homeDirectory: home,
+            workingDirectory: project)
+
+        XCTAssertTrue(config.systemPrompt.contains("CUSTOM_SYSTEM_PROMPT"))
+        XCTAssertTrue(config.systemPrompt.contains("PROJECT_GUIDANCE"))
+        XCTAssertTrue(config.systemPrompt.contains("## Skills"))
+        XCTAssertTrue(config.systemPrompt.contains("## MCP Tools"))
+        XCTAssertFalse(config.systemPrompt.contains("HOME_DEFAULT"))
+        XCTAssertFalse(config.systemPrompt.contains("PROJECT_DEFAULT"))
+    }
+
     func testSkillLibraryDoesNotInflateStartupPrompt() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

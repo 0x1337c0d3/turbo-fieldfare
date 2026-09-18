@@ -206,6 +206,21 @@ swift run -c release TurboFieldfareRepack \
   --resume
 ```
 
+To install the experimental hybrid with only the dense shared experts sourced
+from the pinned 8-bit checkpoint, add `--shared-expert-8bit`:
+
+```bash
+swift run -c release TurboFieldfareRepack \
+  --output scratch/gemma4-shared8.gturbo \
+  --shared-expert-8bit
+```
+
+This leaves embeddings, attention, and all 128 routed experts at 4-bit; routers
+remain 8-bit. It adds about 268 MB to the installed weights and download. The
+default install is unchanged. See
+[8-bit shared-expert experiment](docs/SHARED_EXPERT_8BIT_EXPERIMENT.md) for the
+pinned sources and comparison procedure.
+
 Remove saved download state:
 
 ```bash

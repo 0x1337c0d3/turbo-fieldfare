@@ -1,124 +1,63 @@
 ---
 name: setup
-description: Bootstrap the Rust dev environment — verify rustup, toolchain, rust-analyzer, cargo tools, codex-nav, and env vars.
+description: Verify and bootstrap the TurboFieldfare Swift and Metal development environment on Apple Silicon without downloading or running the model.
 ---
 
 # /setup
 
-Bootstrap (or re-verify) the development environment. Idempotent — safe to re-run.
+Verify the local development environment. This workflow is model-free: do not
+download, repack, load, duplicate, or delete a `.gturbo` model.
 
-## Steps
+## Checks
 
-### 1. Verify `rustup` is installed
+1. Read `AGENTS.md` and the `swift-tools-version` line in `Package.swift`.
+2. Report the host and toolchain:
 
-```bash
-rustup --version
-```
+   ```bash
+   uname -m
+   sw_vers
+   swift --version
+   xcode-select -p
+   xcodebuild -version
+   xcrun --find metal
+   ```
 
-If missing: stop and tell the user to install `rustup` from https://rustup.rs/. Do not attempt to install it without asking.
+   TurboFieldfare requires Apple Silicon, macOS 26 or newer, and Swift 6.2 or
+   newer. If one is missing or too old, stop and name the unmet requirement.
+   Do not switch or install Xcode without the user's approval.
 
-### 2. Verify the active toolchain
+3. Verify that the bundled formatter is available:
 
-```bash
-rustup show active-toolchain
-```
+   ```bash
+   swift format --version
+   ```
 
-If a `rust-toolchain.toml` file exists in the project root, verify the pinned toolchain is installed:
+4. Build the same configuration used by CI:
 
-```bash
-rustup toolchain list
-```
+   ```bash
+   swift build -c release
+   ```
 
-If the pinned toolchain is missing, install it:
+   Dependency resolution performed by SwiftPM is expected. If it changes
+   `Package.resolved`, report that change; do not silently stage it. Report
+   compiler failures verbatim and do not turn `/setup` into an implementation
+   task.
 
-```bash
-rustup toolchain install "$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)"
-```
+5. If the user intends to run inference later, report readiness without taking
+   corrective action:
 
-### 3. Verify the `rust-analyzer` editor LSP is available
+   ```bash
+   test -f scratch/gemma4.gturbo
+   memory_pressure -Q
+   pgrep -fl 'TurboFieldfareServer|TurboFieldfareMac|TurboFieldfareDecodeService|TurboFieldfareCLI|TurboFieldfarePackageTests|swiftpm-testing-helper|mlx_lm|mlx-lm'
+   ```
 
-```bash
-rustup component list --installed | grep rust-analyzer
-```
+   A missing model is not a development-setup failure. Do not set or request
+   `HF_TOKEN` unless the user asks to install/repack the model. Never terminate
+   an existing model process.
 
-If not installed, add it:
+## Report
 
-```bash
-rustup component add rust-analyzer
-```
-
-Also check that the binary is reachable:
-
-```bash
-rust-analyzer --version
-```
-
-If `rust-analyzer` is not found even after `rustup component add`, warn the user — it may need to be installed as a standalone binary or via their editor's extension.
-
-### 4. Verify required cargo components
-
-Check for and install if missing:
-
-```bash
-# rustfmt
-rustup component list --installed | grep rustfmt || rustup component add rustfmt
-
-# clippy
-rustup component list --installed | grep clippy || rustup component add clippy
-
-# llvm-cov (coverage)
-cargo llvm-cov --version 2>/dev/null || cargo install cargo-llvm-cov
-rustup component list --installed | grep llvm-tools || rustup component add llvm-tools-preview
-```
-
-### 5. Verify the `codex-nav` MCP is available
-
-Use the `codex-nav` MCP supplied by the agent environment and initialize its
-local index:
-
-```text
-code_nav_init()
-```
-
-If the tool is unavailable or initialization fails, report `codex-nav` as
-missing and tell the user to configure it in their agent environment. Do not
-install `rust-analyzer-mcp` and do not create a repository-local `.mcp.json`.
-The `.codex-nav/` index is local tooling state and must remain Gitignored.
-
-### 6. Run `cargo check`
-
-```bash
-cargo check
-```
-
-This verifies the project compiles without producing a linked executable. If it
-fails, report the compiler error verbatim — do not attempt to fix compilation
-errors during setup.
-
-### 7. Ensure `.env` exists (if `.env-template` is present)
-
-```bash
-test -f .env || (test -f .env-template && cp .env-template .env)
-```
-
-If `.env` was just created, enumerate the keys the user needs to fill in (read `.env-template`).
-
-### 8. Report
-
-Print a short status block:
-
-```
-Setup status
-  rustup              : <version>
-  toolchain           : <active toolchain>
-  rust-analyzer       : <version | missing>
-  rustfmt             : <installed | missing>
-  clippy              : <installed | missing>
-  cargo-llvm-cov      : <version | missing>
-  codex-nav           : <ready | missing>
-  cargo check         : <ok | FAILED>
-  .env                : <present | created from template | not applicable>
-  RUST_LOG            : <set | unset>
-```
-
-Keep it tight — one line per item. If everything is green, end with "Ready." If anything is yellow/red, list the next action explicitly.
+Return a compact status for architecture, macOS, Swift, Xcode/Metal compiler,
+release build, and optional model-run readiness. End with the exact next action
+for any failed requirement.
