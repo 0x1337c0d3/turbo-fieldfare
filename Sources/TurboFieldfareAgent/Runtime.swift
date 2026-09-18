@@ -15,13 +15,9 @@ final class AgentState: @unchecked Sendable {
 // MARK: - AgentRuntime
 // Access is serialized by the REPL or AgentCore.
 final class AgentRuntime: @unchecked Sendable {
-  let context: MetalContext
-  let model: Model
-  let runner: RealForwardRunner
-  let scratch: RawCompletionScratch
-  let tokenizer: GFTokenizer
   let config: AgentConfig
-
+  let backend: any InferenceBackend
+  let gemmaBackend: MetalGemmaBackend?
   let statusLine = AgentStatusLine()
 
   var remainingToolCalls = 64
@@ -32,7 +28,14 @@ final class AgentRuntime: @unchecked Sendable {
   var routingMode: RoutingMode = .auto
   var openAIClient: OpenAIClient? = OpenAIClient()
 
-  var committedTokenIDs: [Int32] = []
+  var committedTokenIDs: [Int32] {
+    get { gemmaBackend?.committedTokenIDs ?? _committedTokenIDs }
+    set {
+      _committedTokenIDs = newValue
+      gemmaBackend?.committedTokenIDs = newValue
+    }
+  }
+  private var _committedTokenIDs: [Int32] = []
 
   init(config: AgentConfig) async throws {
     self.config = config
@@ -46,28 +49,71 @@ final class AgentRuntime: @unchecked Sendable {
       }
     }
 
-    let modelURL = URL(fileURLWithPath: config.args.model)
-    self.context = try MetalContext()
-    let runtime = try config.args.resolvedRuntimeConfiguration(
-      forceLogitsHead: true, imagePrompt: false)
+    switch config.backend {
+    case .apple:
+      #if canImport(FoundationModels)
+        if #available(macOS 27.0, *) {
+          self.backend = AppleFoundationModelBackend(
+            pccPolicy: config.pccPolicy,
+            systemPrompt: config.systemPrompt
+          )
+          self.gemmaBackend = nil
+        } else {
+          printColor(
+            "[Apple Foundation Models require macOS 27.0 (Golden Gate) or later. Falling back to Gemma...]\n",
+            color: "yellow")
+          let gemmaPath =
+            (config.args.model == "none" || config.args.model.isEmpty)
+            ? config.defaultModelURL.path : config.args.model
+          if FileManager.default.fileExists(atPath: gemmaPath) {
+            let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+            self.backend = gemma
+            self.gemmaBackend = gemma
+          } else if let openAI = openAIClient {
+            printColor(
+              "[Gemma model not found at \(gemmaPath). Falling back to OpenAI...]\n",
+              color: "yellow")
+            self.backend = try OpenAICompatibleBackend(client: openAI)
+            self.gemmaBackend = nil
+          } else {
+            let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+            self.backend = gemma
+            self.gemmaBackend = gemma
+          }
+        }
+      #else
+        printColor(
+          "[Apple Foundation Models require macOS 27.0 (Golden Gate) or later with FoundationModels. Falling back to Gemma...]\n",
+          color: "yellow")
+        let gemmaPath =
+          (config.args.model == "none" || config.args.model.isEmpty)
+          ? config.defaultModelURL.path : config.args.model
+        if FileManager.default.fileExists(atPath: gemmaPath) {
+          let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+          self.backend = gemma
+          self.gemmaBackend = gemma
+        } else if let openAI = openAIClient {
+          printColor(
+            "[Gemma model not found at \(gemmaPath). Falling back to OpenAI...]\n",
+            color: "yellow")
+          self.backend = try OpenAICompatibleBackend(client: openAI)
+          self.gemmaBackend = nil
+        } else {
+          let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+          self.backend = gemma
+          self.gemmaBackend = gemma
+        }
+      #endif
 
-    printColor("Loading Gemma 4 Agent from \(config.args.model)...\n", color: "blue")
+    case .gemma:
+      let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+      self.backend = gemma
+      self.gemmaBackend = gemma
 
-    self.model = try Model.load(
-      directoryURL: modelURL,
-      device: context.device,
-      streamingMode: .pread(slotCount: runtime.expertCacheSlots),
-      expertCachePolicy: runtime.modelExpertCachePolicy,
-      integrityPolicy: .fullSha256)
-
-    self.runner = try RealForwardRunner(
-      model: model,
-      context: context,
-      maxContext: config.args.maxContext,
-      runtimeConfiguration: runtime)
-
-    self.scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize)
-    self.tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
+    case .openai:
+      self.backend = try OpenAICompatibleBackend(client: openAIClient)
+      self.gemmaBackend = nil
+    }
   }
 
   func generate(
@@ -76,6 +122,27 @@ final class AgentRuntime: @unchecked Sendable {
     interaction: AgentInteraction? = nil, forceLocal: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
     let definitions = tools ?? ToolRegistry.definitions
+
+    if config.backend == .apple {
+      if interaction == nil {
+        switch config.pccPolicy {
+        case .disable:
+          printColor("[AFM 3 Core: 100% On-Device execution]\n", color: "green")
+        case .require:
+          printColor("[AFM Cloud Pro: Private Cloud Compute session]\n", color: "yellow")
+        case .auto:
+          printColor(
+            "[Apple Foundation Models: AFM 3 Core (On-Device) / PCC (Auto)]\n", color: "blue")
+        }
+      }
+      return try await backend.generate(
+        messages: messages, tools: definitions, interaction: interaction)
+    }
+
+    if config.backend == .openai {
+      return try await backend.generate(
+        messages: messages, tools: definitions, interaction: interaction)
+    }
 
     var target: RouteTarget = .local
     if forceLocal {
@@ -87,7 +154,12 @@ final class AgentRuntime: @unchecked Sendable {
       case .forceCloud:
         target = .cloud
       case .auto:
-        let router = HybridRouter(localRuntime: self, cloudClient: openAIClient)
+        let router = HybridRouter(
+          backendKind: config.backend,
+          pccPolicy: config.pccPolicy,
+          localRuntime: self,
+          cloudClient: openAIClient
+        )
         target = try await router.decide(messages: messages)
       }
     }
@@ -156,108 +228,18 @@ final class AgentRuntime: @unchecked Sendable {
     maxNewTokensOverride: Int? = nil,
     silent: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
-    let definitions = tools ?? ToolRegistry.definitions
-    let promptIds = try tokenizer.encodeToolChat(messages: messages, tools: definitions)
-    let start = AgentPromptCache.start(
-      prompt: promptIds, committed: committedTokenIDs,
-      position: runner.continuationPosition, rewind: runner.rewind(to:))
-    let cachedTokens: Int
-    switch start {
-    case .reset: cachedTokens = 0
-    case .resume(let count): cachedTokens = count
-    }
-
-    if !silent { committedTokenIDs.removeAll(keepingCapacity: true) }
-    let decoder = StructuredAssistantDecoder(
-      tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }))
-
-    if interaction == nil && !silent { statusLine.beginGeneration(contextTokens: cachedTokens) }
-    let state = AgentState()
-    let cancellation = interaction?.cancellation ?? AgentCancellation()
-    let stopAfterTool = AgentCancellation()
-    let terminal =
-      (interaction == nil && !silent) ? TerminalGeneration(cancellation: cancellation) : nil
-    defer { terminal?.restore() }
-
-    func handleDecoderEvents(_ events: [StructuredAssistantEvent]) {
-      for event in events {
-        switch event {
-        case .content(let text):
-          state.content += text
-          if !silent {
-            if let interaction { interaction.text(text) } else { terminal?.text(text) }
-          }
-        case .thought(let text):
-          if !silent {
-            terminal?.thought(text)
-          }
-        case .toolCall(let call):
-          state.calls.append(call)
-          stopAfterTool.cancel()
-        }
-      }
-    }
-
-    let result: RawDecodeResult
-    do {
-      result = try await runRawCompletion(
-        producer: runner,
-        tokenizer: tokenizer,
-        promptIds: promptIds,
-        config: GenerationConfig(
-          maxNewTokens: maxNewTokensOverride ?? config.args.maxNew,
-          temperature: config.args.temperature,
-          topK: config.args.topK,
-          topP: config.args.topP,
-          repetitionPenalty: config.args.repetitionPenalty,
-          seed: config.args.seed,
-          stopStrings: config.args.stops,
-          extraStopTokens: []
-        ),
-        context: context,
-        scratch: scratch,
-        start: start,
-        shouldStop: { stopAfterTool.isCancelled || cancellation.isCancelled || Task.isCancelled },
-        onProgress: { event in
-          switch event {
-          case .prefill(let done, _):
-            if interaction == nil && !silent { self.statusLine.prefill(done: done) }
-          case .token(let index, let tokenID, let delta):
-            if interaction == nil && !silent {
-              self.statusLine.token(count: index + 1, contextTokens: promptIds.count + index)
-            }
-            handleDecoderEvents((try? decoder.consume(tokenID: tokenID, delta: delta)) ?? [])
-          case .tail(let text):
-            handleDecoderEvents((try? decoder.consumeTail(text)) ?? [])
-          }
-        }
+    if let gemma = gemmaBackend {
+      let result = try await gemma.generateLocally(
+        messages: messages,
+        tools: tools,
+        interaction: interaction,
+        maxNewTokensOverride: maxNewTokensOverride,
+        silent: silent
       )
-    } catch {
-      if !silent {
-        await terminal?.finish()
-        statusLine.snapshot.phase = "Error"
-        statusLine.refresh(force: true)
-      }
-      throw error
+      self.lastStopReason = gemma.lastStopReason
+      return result
+    } else {
+      return try await backend.generate(messages: messages, tools: tools, interaction: interaction)
     }
-
-    if !silent { await terminal?.finish() }
-    _ = try? decoder.finish()
-
-    if interaction == nil && !silent {
-      statusLine.finish(
-        tokens: result.newTokens, decodeSeconds: result.decodeSeconds,
-        contextTokens: result.kvPosition)
-    }
-
-    if !silent {
-      lastStopReason = result.reason
-      if interaction?.cancellation.isCancelled == true || Task.isCancelled {
-        committedTokenIDs.removeAll()
-        throw CancellationError()
-      }
-      self.committedTokenIDs = result.kvBackedTokenIDs
-    }
-    return (state.content, state.calls)
   }
 }

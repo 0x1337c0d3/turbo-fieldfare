@@ -56,17 +56,6 @@ enum ConversationTurn {
             role: .tool, content: result, toolCalls: [],
             toolCallID: call.id, name: call.name))
       }
-      if remainingRounds == 0 {
-        // One final pass to allow the model to provide its summary/conclusion
-        let (finalContent, _) = try await generate(messages)
-        let finalTrimmed = finalContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolved = finalTrimmed.isEmpty ? "Task completed." : finalContent
-        messages.append(
-          GFTokenizer.Message(
-            role: .assistant, content: resolved,
-            toolCalls: [], toolCallID: nil, name: nil))
-        return resolved
-      }
     }
     throw TurnError.roundLimit
   }

@@ -1,12 +1,41 @@
 import Foundation
 import TurboFieldfareCLICore
 
-struct AgentConfig: Sendable {
-  let args: Args
-  let systemPrompt: String
-  let routingMode: String?
+public enum AgentBackendKind: String, Sendable, CaseIterable {
+  case apple = "apple"
+  case gemma = "gemma"
+  case openai = "openai"
+}
 
-  init(
+public enum PCCPolicy: String, Sendable, CaseIterable {
+  case auto = "auto"
+  case disable = "disable"
+  case require = "require"
+}
+
+public enum AgentConfigError: Error, CustomStringConvertible {
+  case invalidBackend(String)
+  case invalidPCCPolicy(String)
+
+  public var description: String {
+    switch self {
+    case .invalidBackend(let val):
+      return "Invalid backend: '\(val)'. Supported backends are: apple, gemma, openai."
+    case .invalidPCCPolicy(let val):
+      return "Invalid PCC policy: '\(val)'. Supported policies are: auto, disable, require."
+    }
+  }
+}
+
+public struct AgentConfig: Sendable {
+  public let args: Args
+  public let systemPrompt: String
+  public let routingMode: String?
+  public let backend: AgentBackendKind
+  public let pccPolicy: PCCPolicy
+  public let defaultModelURL: URL
+
+  public init(
     arguments: [String] = Array(CommandLine.arguments.dropFirst()),
     homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
     workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -14,6 +43,11 @@ struct AgentConfig: Sendable {
     let parsed = try Self.parseArguments(arguments, homeDirectory: homeDirectory)
     self.args = parsed.args
     self.routingMode = parsed.routingMode
+    self.backend = parsed.backend
+    self.pccPolicy = parsed.pccPolicy
+    self.defaultModelURL =
+      homeDirectory
+      .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
     self.systemPrompt = Self.buildSystemPrompt(
       homeDirectory: homeDirectory, workingDirectory: workingDirectory,
       agentsFilePath: parsed.agentsFilePath, systemPromptPath: parsed.systemPromptPath)
@@ -21,12 +55,21 @@ struct AgentConfig: Sendable {
 
   private static func parseArguments(
     _ arguments: [String], homeDirectory: URL
-  ) throws -> (args: Args, agentsFilePath: String?, systemPromptPath: String?, routingMode: String?)
-  {
+  ) throws -> (
+    args: Args,
+    agentsFilePath: String?,
+    systemPromptPath: String?,
+    routingMode: String?,
+    backend: AgentBackendKind,
+    pccPolicy: PCCPolicy
+  ) {
     var rawArgv = arguments
     var systemPromptPath: String?
     var agentsFilePath: String?
     var routingMode: String?
+    var backendArg: String?
+    var pccArg: String?
+    let userSpecifiedModel = rawArgv.contains("--model")
 
     var i = 0
     while i < rawArgv.count {
@@ -42,16 +85,54 @@ struct AgentConfig: Sendable {
         routingMode = rawArgv[i + 1]
         rawArgv.remove(at: i)
         rawArgv.remove(at: i)
+      } else if rawArgv[i] == "--backend", i + 1 < rawArgv.count {
+        backendArg = rawArgv[i + 1]
+        rawArgv.remove(at: i)
+        rawArgv.remove(at: i)
+      } else if rawArgv[i] == "--pcc", i + 1 < rawArgv.count {
+        pccArg = rawArgv[i + 1]
+        rawArgv.remove(at: i)
+        rawArgv.remove(at: i)
       } else {
         i += 1
       }
     }
 
+    let backend: AgentBackendKind
+    if let backendArg {
+      guard let kind = AgentBackendKind(rawValue: backendArg.lowercased()) else {
+        throw AgentConfigError.invalidBackend(backendArg)
+      }
+      backend = kind
+    } else {
+      if userSpecifiedModel {
+        backend = .gemma
+      } else if #available(macOS 27.0, *) {
+        backend = .apple
+      } else {
+        backend = .gemma
+      }
+    }
+
+    let pccPolicy: PCCPolicy
+    if let pccArg {
+      guard let policy = PCCPolicy(rawValue: pccArg.lowercased()) else {
+        throw AgentConfigError.invalidPCCPolicy(pccArg)
+      }
+      pccPolicy = policy
+    } else {
+      pccPolicy = .auto
+    }
+
+    let defaultModel =
+      homeDirectory
+      .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
     if !rawArgv.contains("--model") {
-      let defaultModel =
-        homeDirectory
-        .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
-      rawArgv.append(contentsOf: ["--model", defaultModel.path])
+      if backend == .gemma {
+        rawArgv.append(contentsOf: ["--model", defaultModel.path])
+      } else {
+        rawArgv.append(contentsOf: ["--model", "none"])
+      }
     }
 
     if !rawArgv.contains("--max-context") {
@@ -75,7 +156,7 @@ struct AgentConfig: Sendable {
       throw error
     }
 
-    return (parsedArgs, agentsFilePath, systemPromptPath, routingMode)
+    return (parsedArgs, agentsFilePath, systemPromptPath, routingMode, backend, pccPolicy)
   }
 
   private static func buildSystemPrompt(
