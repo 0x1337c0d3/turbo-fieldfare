@@ -19,9 +19,9 @@ final class TerminalTranscriptTests: XCTestCase {
   func testToggleRestoresAllToolResultsAndRetainsSurroundingText() {
     var transcript = TerminalTranscript()
     transcript.append("Before\n")
-    _ = transcript.appendTool("preview\nFULL FIRST RESULT", limit: 7)
+    _ = transcript.appendTool(header: "preview", result: "FULL FIRST RESULT")
     transcript.append("Between\n")
-    _ = transcript.appendTool("other\nFULL SECOND RESULT", limit: 5)
+    _ = transcript.appendTool(header: "other", result: "FULL SECOND RESULT")
     transcript.append("After\n")
     let collapsed = transcript.rows(width: 80)
     XCTAssertFalse(plain(collapsed).contains("FULL"))
@@ -40,10 +40,11 @@ final class TerminalTranscriptTests: XCTestCase {
     var transcript = TerminalTranscript()
     transcript.toggle()
     XCTAssertFalse(transcript.expanded)
-    _ = transcript.appendTool("", limit: 0)
+    _ = transcript.appendTool(header: "", result: "")
     transcript.toggle()
-    XCTAssertTrue(transcript.appendTool("complete", limit: 1).contains("complete"))
-    XCTAssertTrue(plain(transcript.rows(width: 80)).contains("Ctrl-O collapse"))
+    XCTAssertTrue(
+      transcript.appendTool(header: "complete", result: "complete").contains("complete"))
+    XCTAssertTrue(plain(transcript.rows(width: 80)).contains("ctrl+o to collapse"))
   }
 
   func testThoughtExpansionToggle() {
@@ -51,13 +52,13 @@ final class TerminalTranscriptTests: XCTestCase {
     _ = transcript.appendThought("First line of thinking.\nDetailed second line of deep thought.")
     let collapsed = plain(transcript.rows(width: 80))
     XCTAssertTrue(collapsed.contains("Thinking: First line of thinking."))
-    XCTAssertTrue(collapsed.contains("Ctrl-O expand"))
+    XCTAssertTrue(collapsed.contains("[ctrl+o to expand]"))
     XCTAssertFalse(collapsed.contains("Detailed second line"))
 
     transcript.toggle()
     let expanded = plain(transcript.rows(width: 80))
     XCTAssertTrue(expanded.contains("Detailed second line of deep thought."))
-    XCTAssertTrue(expanded.contains("Ctrl-O collapse"))
+    XCTAssertTrue(expanded.contains("ctrl+o to collapse"))
 
     transcript.toggle()
     XCTAssertEqual(plain(transcript.rows(width: 80)), collapsed)
@@ -65,7 +66,7 @@ final class TerminalTranscriptTests: XCTestCase {
 
   func testExpandedOutputCannotInjectTerminalCommands() {
     var transcript = TerminalTranscript()
-    _ = transcript.appendTool("safe\u{001B}[2J\r\u{009B}31m\u{202E}bad", limit: 4)
+    _ = transcript.appendTool(header: "safe", result: "safe\u{001B}[2J\r\u{009B}31m\u{202E}bad")
     transcript.toggle()
     let output = plain(transcript.rows(width: 100))
     XCTAssertTrue(output.contains("\\u{001B}[2J\\u{000D}\\u{009B}31m\\u{202E}bad"))
@@ -82,7 +83,7 @@ final class TerminalTranscriptTests: XCTestCase {
 
   func testToggleResetsPagingAndDoesNotChangeRetainedData() {
     var transcript = TerminalTranscript()
-    _ = transcript.appendTool(String(repeating: "line\n", count: 100), limit: 10)
+    _ = transcript.appendTool(header: "test", result: String(repeating: "line\n", count: 100))
     transcript.scrollOffset = 99
     transcript.toggle()
     XCTAssertEqual(transcript.scrollOffset, 0)

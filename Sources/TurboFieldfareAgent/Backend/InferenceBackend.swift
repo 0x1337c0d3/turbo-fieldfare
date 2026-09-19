@@ -34,4 +34,24 @@ protocol InferenceBackend: Sendable {
     tools: [GFTokenizer.FunctionDefinition]?,
     interaction: AgentInteraction?
   ) async throws -> (content: String, calls: [ParsedToolCall])
+
+  func generate(
+    messages: [GFTokenizer.Message],
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?,
+    cancellation: AgentCancellation?,
+    terminal: TerminalGeneration?
+  ) async throws -> (content: String, calls: [ParsedToolCall])
+}
+
+extension InferenceBackend {
+  func generate(
+    messages: [GFTokenizer.Message],
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?,
+    cancellation: AgentCancellation?,
+    terminal: TerminalGeneration?
+  ) async throws -> (content: String, calls: [ParsedToolCall]) {
+    try await generate(messages: messages, tools: tools, interaction: interaction)
+  }
 }

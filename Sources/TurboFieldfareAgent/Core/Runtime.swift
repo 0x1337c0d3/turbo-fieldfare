@@ -16,8 +16,9 @@ final class AgentState: @unchecked Sendable {
 // Access is serialized by the REPL or AgentCore.
 final class AgentRuntime: @unchecked Sendable {
   let config: AgentConfig
-  let backend: any InferenceBackend
-  let gemmaBackend: MetalGemmaBackend?
+  var appleBackend: AppleFoundationModelBackend?
+  var openAIBackend: OpenAICompatibleBackend?
+  var gemmaBackend: MetalGemmaBackend?
   let statusLine = AgentStatusLine()
 
   var remainingToolCalls = 64
@@ -37,8 +38,180 @@ final class AgentRuntime: @unchecked Sendable {
   }
   private var _committedTokenIDs: [Int32] = []
 
+  /// Concrete inference targets supported by the agent.
+  public enum ModelTarget: String, Sendable, CaseIterable {
+    case appleOnDevice = "apple-local"
+    case appleCloud = "apple-pcc"
+    case openai = "openai"
+    case gemma = "gemma"
+
+    public var label: String {
+      switch self {
+      case .appleOnDevice: return "Apple AFM 3 Core (On-Device Local)"
+      case .appleCloud: return "Apple AFM Cloud Pro (Private Cloud Compute)"
+      case .openai: return "OpenAI / OpenRouter"
+      case .gemma: return "Gemma 4 (Local Metal)"
+      }
+    }
+
+    public var isLocal: Bool {
+      switch self {
+      case .appleOnDevice, .gemma: return true
+      case .appleCloud, .openai: return false
+      }
+    }
+  }
+
+  /// Current active model target.
+  var currentTarget: ModelTarget {
+    switch activeBackendKind {
+    case .apple:
+      return (applePCCPolicy == .disable) ? .appleOnDevice : .appleCloud
+    case .openai:
+      return .openai
+    case .gemma:
+      return .gemma
+    }
+  }
+
+  /// Targets available for Shift-Tab cycling — includes both local and cloud options.
+  var availableTargets: [ModelTarget] {
+    var targets: [ModelTarget] = []
+    if appleBackend != nil {
+      targets.append(.appleOnDevice)
+      targets.append(.appleCloud)
+    }
+    if openAIBackend != nil {
+      targets.append(.openai)
+    }
+    if hasGemmaModel || gemmaBackend != nil {
+      targets.append(.gemma)
+    }
+    return targets.isEmpty ? [.appleOnDevice] : targets
+  }
+
+  /// Whether a local Gemma .gturbo model directory exists.
+  var hasGemmaModel: Bool {
+    FileManager.default.fileExists(atPath: config.defaultModelURL.path)
+  }
+
+  /// Switches active execution target and updates status line context ceiling.
+  func switchTo(target: ModelTarget) {
+    switch target {
+    case .appleOnDevice:
+      activeBackendKind = .apple
+      applePCCPolicy = .disable
+      statusLine.snapshot.maxContext = appleBackend?.capabilities.maxContextLength ?? 8_192
+      statusLine.snapshot.modelLabel = "AFM On-Device"
+      statusLine.refresh(force: true)
+
+    case .appleCloud:
+      activeBackendKind = .apple
+      applePCCPolicy = .require
+      statusLine.snapshot.maxContext = 32_768
+      statusLine.snapshot.modelLabel = "AFM Cloud (PCC)"
+      statusLine.refresh(force: true)
+
+    case .openai:
+      activeBackendKind = .openai
+      statusLine.snapshot.maxContext = openAIBackend?.capabilities.maxContextLength ?? 128_000
+      statusLine.snapshot.modelLabel = openAIBackend.map { "\($0.client.modelName)" } ?? "OpenAI"
+      statusLine.refresh(force: true)
+      if let backend = openAIBackend {
+        Task {
+          _ = await backend.updateContextLength()
+          if self.currentTarget == .openai {
+            self.statusLine.snapshot.maxContext = backend.capabilities.maxContextLength
+            self.statusLine.refresh(force: true)
+          }
+        }
+      }
+
+    case .gemma:
+      activeBackendKind = .gemma
+      statusLine.snapshot.maxContext = config.args.maxContext
+      statusLine.snapshot.modelLabel = "Gemma 4 Metal"
+      statusLine.refresh(force: true)
+    }
+    resetToolBudget()
+  }
+
+  /// The maximum rounds allowed for the active model target.
+  /// Turn limits apply only to on-device local models (Gemma 4 and AFM 3 On-Device Core).
+  /// Cloud models (OpenAI/OpenRouter and AFM 3 Private Cloud Compute) are unbounded by default.
+  var effectiveMaxRounds: Int {
+    if let explicit = config.explicitMaxRounds {
+      return explicit
+    }
+    if currentTarget.isLocal {
+      return config.maxRounds
+    }
+    return Int.max
+  }
+
+  /// Resets the remaining tool execution budget for a turn based on effectiveMaxRounds.
+  func resetToolBudget() {
+    let rounds = effectiveMaxRounds
+    if rounds == Int.max {
+      remainingToolCalls = Int.max
+    } else {
+      remainingToolCalls = max(64, rounds * 2)
+    }
+  }
+
+  /// Ensures the local Gemma Metal model is loaded into memory on demand.
+  func ensureGemmaLoaded() async throws -> MetalGemmaBackend {
+    if let gemma = gemmaBackend { return gemma }
+    let modelURL = config.defaultModelURL
+    guard FileManager.default.fileExists(atPath: modelURL.path) else {
+      throw MetalGemmaError.modelNotFound(modelURL.path)
+    }
+    printColor(
+      "\n[Loading Gemma 4 Local Metal from \(modelURL.lastPathComponent)...]\n", color: "blue")
+    let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
+    self.gemmaBackend = gemma
+    return gemma
+  }
+
+  /// The currently active backend interface based on activeBackendKind.
+  var backend: any InferenceBackend {
+    switch activeBackendKind {
+    case .apple:
+      if let apple = appleBackend { return apple }
+    case .openai:
+      if let openAI = openAIBackend { return openAI }
+    case .gemma:
+      if let gemma = gemmaBackend { return gemma }
+      return FallbackGemmaCapabilitiesBackend(maxContext: config.args.maxContext)
+    }
+    if let apple = appleBackend { return apple }
+    if let openAI = openAIBackend { return openAI }
+    if let gemma = gemmaBackend { return gemma }
+    fatalError("No inference backend initialized")
+  }
+
+  /// Live PCC policy for the Apple backend. Changing this takes effect on the next generate() call.
+  var applePCCPolicy: PCCPolicy {
+    get { appleBackend?.pccPolicy ?? config.pccPolicy }
+    set { appleBackend?.pccPolicy = newValue }
+  }
+
+  /// The backend currently active for generation. Changed live by the Shift-Tab toggle.
+  var activeBackendKind: AgentBackendKind
+
+  /// Backends available for Shift-Tab cycling — only those with initialised objects/clients.
+  var availableBackends: [AgentBackendKind] {
+    var list: [AgentBackendKind] = []
+    if appleBackend != nil { list.append(.apple) }
+    if openAIBackend != nil { list.append(.openai) }
+    if gemmaBackend != nil || hasGemmaModel { list.append(.gemma) }
+    return list.isEmpty ? [activeBackendKind] : list
+  }
+
   init(config: AgentConfig) async throws {
     self.config = config
+    self.activeBackendKind = config.backend
+    resetToolBudget()
 
     if let rm = config.routingMode {
       switch rm {
@@ -49,182 +222,164 @@ final class AgentRuntime: @unchecked Sendable {
       }
     }
 
-    switch config.backend {
-    case .apple:
-      #if canImport(FoundationModels)
-        if #available(macOS 27.0, *) {
-          self.backend = AppleFoundationModelBackend(
-            pccPolicy: config.pccPolicy,
-            systemPrompt: config.systemPrompt
-          )
-          self.gemmaBackend = nil
-        } else {
-          printColor(
-            "[Apple Foundation Models require macOS 27.0 (Golden Gate) or later. Falling back to Gemma...]\n",
-            color: "yellow")
-          let gemmaPath =
-            (config.args.model == "none" || config.args.model.isEmpty)
-            ? config.defaultModelURL.path : config.args.model
-          if FileManager.default.fileExists(atPath: gemmaPath) {
-            let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
-            self.backend = gemma
-            self.gemmaBackend = gemma
-          } else if let openAI = openAIClient {
-            printColor(
-              "[Gemma model not found at \(gemmaPath). Falling back to OpenAI...]\n",
-              color: "yellow")
-            self.backend = try OpenAICompatibleBackend(client: openAI)
-            self.gemmaBackend = nil
-          } else {
-            let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
-            self.backend = gemma
-            self.gemmaBackend = gemma
+    // 1. Initialize Apple backend if supported on macOS 27+
+    #if canImport(FoundationModels)
+      if #available(macOS 27.0, *) {
+        self.appleBackend = AppleFoundationModelBackend(
+          pccPolicy: config.pccPolicy,
+          systemPrompt: config.systemPrompt,
+          statusLine: statusLine
+        )
+      }
+    #endif
+
+    // 2. Initialize OpenAI backend if configuration is present
+    if let client = openAIClient {
+      let backend = try? OpenAICompatibleBackend(client: client, statusLine: statusLine)
+      self.openAIBackend = backend
+      if let backend {
+        Task {
+          _ = await backend.updateContextLength()
+          if self.currentTarget == .openai {
+            self.statusLine.snapshot.maxContext = backend.capabilities.maxContextLength
+            self.statusLine.refresh(force: true)
           }
         }
-      #else
-        printColor(
-          "[Apple Foundation Models require macOS 27.0 (Golden Gate) or later with FoundationModels. Falling back to Gemma...]\n",
-          color: "yellow")
-        let gemmaPath =
-          (config.args.model == "none" || config.args.model.isEmpty)
-          ? config.defaultModelURL.path : config.args.model
-        if FileManager.default.fileExists(atPath: gemmaPath) {
-          let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
-          self.backend = gemma
-          self.gemmaBackend = gemma
-        } else if let openAI = openAIClient {
-          printColor(
-            "[Gemma model not found at \(gemmaPath). Falling back to OpenAI...]\n",
-            color: "yellow")
-          self.backend = try OpenAICompatibleBackend(client: openAI)
-          self.gemmaBackend = nil
-        } else {
-          let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
-          self.backend = gemma
-          self.gemmaBackend = gemma
-        }
-      #endif
+      }
+    }
 
-    case .gemma:
+    // 3. Initialize Gemma backend if explicitly requested
+    if config.backend == .gemma {
       let gemma = try await MetalGemmaBackend(config: config, statusLine: statusLine)
-      self.backend = gemma
       self.gemmaBackend = gemma
-
-    case .openai:
-      self.backend = try OpenAICompatibleBackend(client: openAIClient)
+    } else {
       self.gemmaBackend = nil
+    }
+
+    // Fallbacks if requested backend could not be initialized
+    if config.backend == .apple && self.appleBackend == nil {
+      printColor(
+        "[Apple Foundation Models require macOS 27.0 (Golden Gate) or later with FoundationModels. Falling back...]\n",
+        color: "yellow")
+      if self.openAIBackend != nil {
+        self.activeBackendKind = .openai
+      } else if hasGemmaModel {
+        self.activeBackendKind = .gemma
+      }
+    } else if config.backend == .openai && self.openAIBackend == nil {
+      if self.appleBackend != nil {
+        self.activeBackendKind = .apple
+      } else if hasGemmaModel {
+        self.activeBackendKind = .gemma
+      }
+    }
+
+    // Set the initial status-bar model label based on the resolved active backend.
+    switch activeBackendKind {
+    case .apple:
+      statusLine.snapshot.modelLabel =
+        (config.pccPolicy == .require) ? "AFM Cloud (PCC)" : "AFM On-Device"
+    case .openai:
+      statusLine.snapshot.modelLabel =
+        openAIClient.map { $0.modelName } ?? "OpenAI"
+    case .gemma:
+      statusLine.snapshot.modelLabel = "Gemma 4 Metal"
     }
   }
 
   func generate(
     messages: [GFTokenizer.Message],
     tools: [GFTokenizer.FunctionDefinition]? = nil,
-    interaction: AgentInteraction? = nil, forceLocal: Bool = false
+    interaction: AgentInteraction? = nil,
+    cancellation: AgentCancellation? = nil,
+    terminal: TerminalGeneration? = nil,
+    forceLocal: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
     let definitions = tools ?? ToolRegistry.definitions
 
-    if config.backend == .apple {
-      if interaction == nil {
-        switch config.pccPolicy {
-        case .disable:
-          printColor("[AFM 3 Core: 100% On-Device execution]\n", color: "green")
-        case .require:
-          printColor("[AFM Cloud Pro: Private Cloud Compute session]\n", color: "yellow")
-        case .auto:
-          printColor(
-            "[Apple Foundation Models: AFM 3 Core (On-Device) / PCC (Auto)]\n", color: "blue")
-        }
-      }
-      return try await backend.generate(
-        messages: messages, tools: definitions, interaction: interaction)
-    }
-
-    if config.backend == .openai {
-      return try await backend.generate(
-        messages: messages, tools: definitions, interaction: interaction)
-    }
-
-    var target: RouteTarget = .local
-    if forceLocal {
-      target = .local
-    } else {
-      switch routingMode {
-      case .forceLocal:
-        target = .local
-      case .forceCloud:
-        target = .cloud
-      case .auto:
-        let router = HybridRouter(
-          backendKind: config.backend,
-          pccPolicy: config.pccPolicy,
-          localRuntime: self,
-          cloudClient: openAIClient
-        )
-        target = try await router.decide(messages: messages)
-      }
-    }
-
-    if target == .cloud, let client = openAIClient {
-      if interaction == nil {
-        terminalPrint("\n\u{001B}[33m[Auto-Routed to Cloud (OpenAI)]\u{001B}[0m\n")
+    switch activeBackendKind {
+    case .apple:
+      if let apple = appleBackend {
+        return try await apple.generate(
+          messages: messages, tools: definitions, interaction: interaction,
+          cancellation: cancellation, terminal: terminal)
       }
 
-      let cancellation = interaction?.cancellation ?? AgentCancellation()
-      let terminal = (interaction == nil) ? TerminalGeneration(cancellation: cancellation) : nil
-
-      do {
-        let result = try await client.generate(messages: messages, tools: definitions)
-
-        if let interaction {
-          interaction.text(result.content)
-        } else {
-          terminal?.text(result.content)
-        }
-
-        await terminal?.finish()
+    case .openai:
+      if let openAI = openAIBackend {
         lastStopReason = .endOfTurn
-        return result
-      } catch {
-        await terminal?.finish()
-        if interaction == nil {
-          terminalPrint(
-            "\n\u{001B}[31m[Cloud route failed: \(error). Falling back to Local...]\u{001B}[0m\n")
-        }
-        return try await generateLocally(
-          messages: messages, tools: definitions, interaction: interaction)
+        return try await openAI.generate(
+          messages: messages, tools: definitions, interaction: interaction,
+          cancellation: cancellation, terminal: terminal)
       }
-    } else {
-      if routingMode == .auto && interaction == nil {
-        terminalPrint("\n\u{001B}[32m[Auto-Routed to Local (Embedded)]\u{001B}[0m\n")
-      }
-      do {
-        return try await generateLocally(
-          messages: messages, tools: definitions, interaction: interaction)
-      } catch {
-        if let client = openAIClient {
-          if interaction == nil {
-            terminalPrint(
-              "\n\u{001B}[31m[Local route failed: \(error). Falling back to Cloud...]\u{001B}[0m\n")
-          }
-          let result = try await client.generate(messages: messages, tools: definitions)
-          if interaction == nil {
-            terminalPrint(result.content)
-          } else {
-            interaction?.text(result.content)
-          }
-          lastStopReason = .endOfTurn
-          return result
+
+    case .gemma:
+      let _ = try await ensureGemmaLoaded()
+      if gemmaBackend != nil {
+        var target: RouteTarget = .local
+        if forceLocal {
+          target = .local
         } else {
-          throw error
+          switch routingMode {
+          case .forceLocal:
+            target = .local
+          case .forceCloud:
+            target = .cloud
+          case .auto:
+            let router = HybridRouter(
+              backendKind: config.backend,
+              pccPolicy: config.pccPolicy,
+              localRuntime: self,
+              cloudClient: openAIClient
+            )
+            target = try await router.decide(messages: messages)
+          }
+        }
+
+        if target == .cloud, let openAI = openAIBackend {
+          if interaction == nil {
+            terminalPrint("\n\u{001B}[33m[Auto-Routed to Cloud (OpenAI)]\u{001B}[0m\n")
+          }
+          do {
+            let result = try await openAI.generate(
+              messages: messages, tools: definitions, interaction: interaction,
+              cancellation: cancellation, terminal: terminal)
+            lastStopReason = .endOfTurn
+            return result
+          } catch is CancellationError {
+            throw CancellationError()
+          } catch {
+            if interaction == nil {
+              terminalPrint(
+                "\n\u{001B}[31m[Cloud route failed: \(error). Falling back to Local...]\u{001B}[0m\n"
+              )
+            }
+            return try await generateLocally(
+              messages: messages, tools: definitions, interaction: interaction,
+              cancellation: cancellation, terminal: terminal)
+          }
+        } else {
+          if routingMode == .auto && interaction == nil {
+            terminalPrint("\n\u{001B}[32m[Auto-Routed to Local (Embedded)]\u{001B}[0m\n")
+          }
+          return try await generateLocally(
+            messages: messages, tools: definitions, interaction: interaction,
+            cancellation: cancellation, terminal: terminal)
         }
       }
     }
+
+    return try await backend.generate(
+      messages: messages, tools: definitions, interaction: interaction,
+      cancellation: cancellation, terminal: terminal)
   }
 
   func generateLocally(
     messages: [GFTokenizer.Message],
     tools: [GFTokenizer.FunctionDefinition]? = nil,
     interaction: AgentInteraction? = nil,
+    cancellation: AgentCancellation? = nil,
+    terminal: TerminalGeneration? = nil,
     maxNewTokensOverride: Int? = nil,
     silent: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
@@ -233,13 +388,41 @@ final class AgentRuntime: @unchecked Sendable {
         messages: messages,
         tools: tools,
         interaction: interaction,
+        cancellation: cancellation,
+        terminal: terminal,
         maxNewTokensOverride: maxNewTokensOverride,
         silent: silent
       )
       self.lastStopReason = gemma.lastStopReason
       return result
     } else {
-      return try await backend.generate(messages: messages, tools: tools, interaction: interaction)
+      return try await backend.generate(
+        messages: messages, tools: tools, interaction: interaction,
+        cancellation: cancellation, terminal: terminal)
     }
+  }
+}
+
+/// Fallback capabilities representation for Gemma before weights are loaded into memory.
+private struct FallbackGemmaCapabilitiesBackend: InferenceBackend {
+  let capabilities: BackendCapabilities
+
+  init(maxContext: Int) {
+    self.capabilities = BackendCapabilities(
+      name: "Metal Gemma 4 (Local Metal)",
+      supportsTools: true,
+      supportsStreaming: true,
+      maxContextLength: maxContext,
+      isOnDevice: true,
+      isPrivateCloudCompute: false
+    )
+  }
+
+  func generate(
+    messages: [GFTokenizer.Message],
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?
+  ) async throws -> (content: String, calls: [ParsedToolCall]) {
+    fatalError("ensureGemmaLoaded() must be called before generate()")
   }
 }

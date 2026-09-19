@@ -108,25 +108,18 @@ public struct MCPJSONSchemaBridge: Sendable {
       """
       ## Tool Calling Instructions
       CRITICAL INSTRUCTIONS:
-      1. When asked to inspect, read, or solve something in a file or directory (e.g. `scratch/swe3/prompt.md`), your VERY FIRST action MUST be calling `read_file` to read the file. Do NOT guess or hallucinate file contents or problem definitions.
-      2. If the problem references or imports other files in the workspace (such as `scratch/swe3/problem.py`), read those files or list the directory using `list_dir`.
-      3. If you need to use a tool, emit a markdown code block tagged `tool_call` containing a valid JSON object:
+      1. When asked to inspect, read, or modify something in a file or directory, your first action should be calling `read_file` or `list_dir`. Do NOT guess or hallucinate file contents.
+      2. If you need to use a tool, emit a markdown code block tagged `tool_call` containing a valid JSON object:
       ```tool_call
-      {"name": "read_file", "arguments": {"path": "scratch/swe3/prompt.md"}}
+      {"name": "read_file", "arguments": {"path": "Sources/App.swift"}}
       ```
-      4. Stop immediately after emitting the `tool_call` block. Do NOT generate simulated outputs, fake execution results, or hallucinated contents.
-      5. When creating deliverables:
+      3. Stop immediately after emitting the `tool_call` block. Do NOT generate simulated outputs, fake execution results, or hallucinated contents.
+      4. When creating or modifying files:
          - Use `write_file` to save files to disk.
-         - For Python files (`.py`), the `content` MUST be raw, runnable Python code only—never include markdown headings, problem explanations, or markdown fences inside the code file.
-         - If documentation or analysis is requested (e.g. `ALGORITHM_DOCUMENTATION.md`), write it as a separate markdown document using `write_file`.
-         - In `Solver` classes:
-           - Import `Problem` from `problem.py` (`from problem import Problem`).
-           - Remember that `problem.move(mask, callback)` requires `mask` to be an integer with exactly 2 bits set (e.g. `0b0101`, `0b0011`, `0b1001`), and `callback` to be a function taking `(mask, bits)` and returning updated bits.
-           - Implement `def callback(self, mask, bits): ...` and `def solve(self): ...` that repeatedly calls `self.problem.move(self.mask, self.callback)` until `result > 0`.
-           - Include a verification test block under `if __name__ == "__main__":` that creates `Problem()` and runs `Solver(p).solve()` for 5 to 10 trials to prove convergence.
-         - Simply writing code in your assistant message DOES NOT save it to disk. You MUST call `write_file` to write code to disk before executing it.
-      6. When testing with `execute_bash`, provide `arguments` with `"command"` (e.g. `{"name": "execute_bash", "arguments": {"command": "python3 scratch/swe3/solver.py"}}`).
-      7. When all deliverables are created and verified, provide your final answer without `tool_call` blocks.
+         - Source files must contain valid code only—never include markdown explanations or fences inside the saved code file.
+         - Simply writing code in your assistant message DOES NOT save it to disk. You MUST call `write_file` to persist changes.
+      5. When executing shell commands with `execute_bash`, provide `arguments` with `"command"` (e.g. `{"name": "execute_bash", "arguments": {"command": "swift test"}}`).
+      6. When all tasks are completed and verified, provide your final response without `tool_call` blocks.
       """)
     return lines.joined(separator: "\n")
   }

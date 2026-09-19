@@ -5,7 +5,7 @@ import Foundation
 struct TerminalTranscript {
   enum Entry {
     case text(String)
-    case tool(String, Int)
+    case tool(header: String, result: String)
     case thought(String)
   }
 
@@ -32,14 +32,23 @@ struct TerminalTranscript {
     }
   }
 
-  mutating func appendTool(_ result: String, limit: Int) -> String {
-    entries.append(.tool(result, max(0, limit)))
-    return toolText(result, limit: max(0, limit))
+  /// Stores the tool header + result as a single entry and returns the text to
+  /// write immediately (the collapsed one-liner, or the full block if already expanded).
+  mutating func appendTool(header: String, result: String) -> String {
+    entries.append(.tool(header: header, result: result))
+    return toolText(header: header, result: result)
   }
 
   mutating func appendThought(_ thought: String) -> String {
-    entries.append(.thought(thought))
-    return thoughtText(thought)
+    if case .thought(var previous) = entries.last {
+      entries.removeLast()
+      previous += thought
+      entries.append(.thought(previous))
+      return thoughtText(thought)
+    } else {
+      entries.append(.thought(thought))
+      return thoughtText(thought)
+    }
   }
 
   mutating func toggle() {
@@ -48,17 +57,23 @@ struct TerminalTranscript {
     scrollOffset = 0
   }
 
-  private func toolText(_ result: String, limit: Int) -> String {
-    let body = expanded ? result : String(result.prefix(limit))
-    let truncated = !expanded && result.count > limit
-    let hint = expanded ? " [Ctrl-O collapse]" : " [Ctrl-O expand]"
-    return "\u{001B}[33m   \(TerminalText.safe(body))\(truncated ? "..." : "")\(hint)\u{001B}[0m\n"
+  private func toolText(header: String, result: String) -> String {
+    if expanded {
+      // Full result indented below the header.
+      let body = TerminalText.safe(result).replacingOccurrences(of: "\n", with: "\n   ")
+      return "\u{001B}[32m\n● \(TerminalText.safe(header))\u{001B}[0m\n"
+        + "\u{001B}[33m   \(body) \u{001B}[90m[ctrl+o to collapse]\u{001B}[0m\n"
+    } else {
+      // Collapsed: header only, hint appended inline. No result body shown.
+      return
+        "\u{001B}[32m\n● \(TerminalText.safe(header))\u{001B}[90m (ctrl+o to expand)\u{001B}[0m\n"
+    }
   }
 
   private func thoughtText(_ thought: String) -> String {
     let trimmed = thought.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return "" }
-    let hint = expanded ? " [Ctrl-O collapse]" : " [Ctrl-O expand]"
+    let hint = expanded ? " [ctrl+o to collapse]" : " [ctrl+o to expand]"
     if expanded {
       return "\u{001B}[90m   Thinking:\(hint)\n   "
         + TerminalText.safe(thought).replacingOccurrences(of: "\n", with: "\n   ") + "\u{001B}[0m\n"
@@ -74,7 +89,7 @@ struct TerminalTranscript {
     let text = entries.map { entry in
       switch entry {
       case .text(let value): return value
-      case .tool(let result, let limit): return toolText(result, limit: limit)
+      case .tool(let header, let result): return toolText(header: header, result: result)
       case .thought(let thought): return thoughtText(thought)
       }
     }.joined()

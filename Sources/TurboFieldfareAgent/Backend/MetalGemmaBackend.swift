@@ -85,10 +85,28 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
     )
   }
 
+  func generate(
+    messages: [GFTokenizer.Message],
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?,
+    cancellation: AgentCancellation?,
+    terminal: TerminalGeneration?
+  ) async throws -> (content: String, calls: [ParsedToolCall]) {
+    return try await generateLocally(
+      messages: messages,
+      tools: tools,
+      interaction: interaction,
+      cancellation: cancellation,
+      terminal: terminal
+    )
+  }
+
   func generateLocally(
     messages: [GFTokenizer.Message],
     tools: [GFTokenizer.FunctionDefinition]? = nil,
     interaction: AgentInteraction? = nil,
+    cancellation: AgentCancellation? = nil,
+    terminal: TerminalGeneration? = nil,
     maxNewTokensOverride: Int? = nil,
     silent: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
@@ -105,15 +123,30 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
 
     if !silent { committedTokenIDs.removeAll(keepingCapacity: true) }
     let decoder = StructuredAssistantDecoder(
-      tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }))
+      tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }), emitThoughts: true)
 
     if interaction == nil && !silent { statusLine.beginGeneration(contextTokens: cachedTokens) }
     let state = AgentState()
-    let cancellation = interaction?.cancellation ?? AgentCancellation()
+    let effectiveCancellation = interaction?.cancellation ?? cancellation ?? AgentCancellation()
     let stopAfterTool = AgentCancellation()
-    let terminal =
-      (interaction == nil && !silent) ? TerminalGeneration(cancellation: cancellation) : nil
-    defer { terminal?.restore() }
+    let activeTerminal: TerminalGeneration?
+    let ownsTerminal: Bool
+    if interaction == nil && !silent {
+      if let terminal {
+        activeTerminal = terminal
+        ownsTerminal = false
+        terminal.beginGeneration()
+      } else {
+        activeTerminal = TerminalGeneration(cancellation: effectiveCancellation)
+        ownsTerminal = true
+      }
+    } else {
+      activeTerminal = nil
+      ownsTerminal = false
+    }
+    defer {
+      if ownsTerminal { activeTerminal?.restore() }
+    }
 
     func handleDecoderEvents(_ events: [StructuredAssistantEvent]) {
       for event in events {
@@ -121,11 +154,11 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
         case .content(let text):
           state.content += text
           if !silent {
-            if let interaction { interaction.text(text) } else { terminal?.text(text) }
+            if let interaction { interaction.text(text) } else { activeTerminal?.text(text) }
           }
         case .thought(let text):
           if !silent {
-            terminal?.thought(text)
+            activeTerminal?.thought(text)
           }
         case .toolCall(let call):
           state.calls.append(call)
@@ -153,7 +186,9 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
         context: context,
         scratch: scratch,
         start: start,
-        shouldStop: { stopAfterTool.isCancelled || cancellation.isCancelled || Task.isCancelled },
+        shouldStop: {
+          stopAfterTool.isCancelled || effectiveCancellation.isCancelled || Task.isCancelled
+        },
         onProgress: { event in
           switch event {
           case .prefill(let done, _):
@@ -170,14 +205,14 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
       )
     } catch {
       if !silent {
-        await terminal?.finish()
+        await activeTerminal?.finishGeneration()
         statusLine.snapshot.phase = "Error"
         statusLine.refresh(force: true)
       }
       throw error
     }
 
-    if !silent { await terminal?.finish() }
+    if !silent { await activeTerminal?.finishGeneration() }
     _ = try? decoder.finish()
 
     if interaction == nil && !silent {
@@ -188,7 +223,7 @@ final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
 
     if !silent {
       lastStopReason = result.reason
-      if interaction?.cancellation.isCancelled == true || Task.isCancelled {
+      if effectiveCancellation.isCancelled || result.reason == .cancelled || Task.isCancelled {
         committedTokenIDs.removeAll()
         throw CancellationError()
       }

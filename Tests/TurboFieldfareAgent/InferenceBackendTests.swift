@@ -55,11 +55,69 @@ final class InferenceBackendTests: XCTestCase, @unchecked Sendable {
     XCTAssertEqual(configWithModel.backend, .gemma)
   }
 
+  func testMaxRoundsDefaultAndOverride() throws {
+    let configDefault = try AgentConfig(arguments: [])
+    XCTAssertEqual(configDefault.maxRounds, 32)
+    XCTAssertNil(configDefault.explicitMaxRounds)
+
+    let configCustom = try AgentConfig(arguments: ["--max-rounds", "64"])
+    XCTAssertEqual(configCustom.maxRounds, 64)
+    XCTAssertEqual(configCustom.explicitMaxRounds, 64)
+
+    let configHigh = try AgentConfig(arguments: ["--max-rounds", "250"])
+    XCTAssertEqual(configHigh.maxRounds, 250)
+    XCTAssertEqual(configHigh.explicitMaxRounds, 250)
+
+    let configInvalid = try AgentConfig(arguments: ["--max-rounds", "-1"])
+    XCTAssertEqual(configInvalid.maxRounds, 32)
+    XCTAssertNil(configInvalid.explicitMaxRounds)
+  }
+
+  func testTurnLimitsOnlyApplyToOnDeviceModels() async throws {
+    // ModelTarget locality checks
+    XCTAssertTrue(AgentRuntime.ModelTarget.appleOnDevice.isLocal)
+    XCTAssertTrue(AgentRuntime.ModelTarget.gemma.isLocal)
+    XCTAssertFalse(AgentRuntime.ModelTarget.appleCloud.isLocal)
+    XCTAssertFalse(AgentRuntime.ModelTarget.openai.isLocal)
+
+    // With default arguments (no --max-rounds), on-device models get 32 rounds, cloud models are unlimited
+    let configDefault = try AgentConfig(arguments: [])
+    let runtimeDefault = try await AgentRuntime(config: configDefault)
+
+    runtimeDefault.switchTo(target: .appleOnDevice)
+    XCTAssertEqual(runtimeDefault.effectiveMaxRounds, 32)
+    XCTAssertEqual(runtimeDefault.remainingToolCalls, 64)
+
+    runtimeDefault.switchTo(target: .gemma)
+    XCTAssertEqual(runtimeDefault.effectiveMaxRounds, 32)
+    XCTAssertEqual(runtimeDefault.remainingToolCalls, 64)
+
+    runtimeDefault.switchTo(target: .openai)
+    XCTAssertEqual(runtimeDefault.effectiveMaxRounds, Int.max)
+    XCTAssertEqual(runtimeDefault.remainingToolCalls, Int.max)
+
+    runtimeDefault.switchTo(target: .appleCloud)
+    XCTAssertEqual(runtimeDefault.effectiveMaxRounds, Int.max)
+    XCTAssertEqual(runtimeDefault.remainingToolCalls, Int.max)
+
+    // With explicit --max-rounds 48, explicit limit applies across all targets
+    let configExplicit = try AgentConfig(arguments: ["--max-rounds", "48"])
+    let runtimeExplicit = try await AgentRuntime(config: configExplicit)
+
+    runtimeExplicit.switchTo(target: .appleOnDevice)
+    XCTAssertEqual(runtimeExplicit.effectiveMaxRounds, 48)
+    XCTAssertEqual(runtimeExplicit.remainingToolCalls, 96)
+
+    runtimeExplicit.switchTo(target: .openai)
+    XCTAssertEqual(runtimeExplicit.effectiveMaxRounds, 48)
+    XCTAssertEqual(runtimeExplicit.remainingToolCalls, 96)
+  }
+
   func testAppleBackendCapabilities() {
     let backendAuto = AppleFoundationModelBackend(pccPolicy: .auto, systemPrompt: "test")
     XCTAssertTrue(backendAuto.capabilities.supportsTools)
     XCTAssertTrue(backendAuto.capabilities.supportsStreaming)
-    XCTAssertEqual(backendAuto.capabilities.maxContextLength, 131_072)
+    XCTAssertEqual(backendAuto.capabilities.maxContextLength, 8_192)
     XCTAssertTrue(backendAuto.capabilities.isOnDevice)
     XCTAssertTrue(backendAuto.capabilities.isPrivateCloudCompute)
 
@@ -226,5 +284,106 @@ final class InferenceBackendTests: XCTestCase, @unchecked Sendable {
     XCTAssertNotNil(content)
     XCTAssertFalse(content!.contains("# Documentation"))
     XCTAssertTrue(content!.contains("class Solver:"))
+  }
+
+  func testOpenRouterModelsResponseDecodingAndContextLengthMatching() throws {
+    let json = """
+      {
+        "data": [
+          {
+            "id": "google/gemini-3.8-flash",
+            "name": "Google: Gemini 3.8 Flash",
+            "context_length": 1048576,
+            "top_provider": {
+              "context_length": 1048576,
+              "max_completion_tokens": 65536
+            }
+          },
+          {
+            "id": "anthropic/claude-3.7-sonnet",
+            "name": "Anthropic: Claude 3.7 Sonnet",
+            "context_length": 200000,
+            "top_provider": {
+              "context_length": 200000
+            }
+          },
+          {
+            "id": "openai/gpt-4o",
+            "name": "OpenAI: GPT-4o",
+            "context_length": 128000
+          }
+        ]
+      }
+      """
+    let response = try JSONDecoder().decode(OpenRouterModelsResponse.self, from: Data(json.utf8))
+    XCTAssertEqual(response.data.count, 3)
+
+    let client = OpenAIClient(
+      apiKey: "test",
+      baseURL: URL(string: "https://openrouter.ai/api/v1")!,
+      modelName: "google/gemini-3.8-flash"
+    )
+
+    // Exact match
+    XCTAssertEqual(
+      client.findContextLength(for: "google/gemini-3.8-flash", in: response.data), 1_048_576)
+    // Case-insensitive match
+    XCTAssertEqual(
+      client.findContextLength(for: "Google/Gemini-3.8-Flash", in: response.data), 1_048_576)
+    // Model name without vendor prefix
+    XCTAssertEqual(client.findContextLength(for: "gemini-3.8-flash", in: response.data), 1_048_576)
+    // Model with tag variant
+    XCTAssertEqual(
+      client.findContextLength(for: "google/gemini-3.8-flash:free", in: response.data), 1_048_576)
+
+    // Other models
+    XCTAssertEqual(client.findContextLength(for: "claude-3.7-sonnet", in: response.data), 200_000)
+    XCTAssertEqual(client.findContextLength(for: "gpt-4o", in: response.data), 128_000)
+    // Unknown model
+    XCTAssertNil(client.findContextLength(for: "unknown-model-xyz", in: response.data))
+  }
+
+  func testOpenAIResponseUsageDecoding() throws {
+    let json = """
+      {
+        "id": "gen-123",
+        "choices": [
+          {
+            "message": {
+              "content": "Hello world!"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 150,
+          "completion_tokens": 25,
+          "total_tokens": 175
+        }
+      }
+      """
+    let response = try JSONDecoder().decode(OpenAIResponse.self, from: Data(json.utf8))
+    XCTAssertEqual(response.choices.first?.message.content, "Hello world!")
+    XCTAssertEqual(response.usage?.promptTokens, 150)
+    XCTAssertEqual(response.usage?.completionTokens, 25)
+    XCTAssertEqual(response.usage?.totalTokens, 175)
+  }
+
+  func testOpenAIBackendContextSizeAndStatusLineUpdates() async throws {
+    let statusLine = AgentStatusLine()
+    let client = OpenAIClient(
+      apiKey: "test",
+      baseURL: URL(string: "https://openrouter.ai/api/v1")!,
+      modelName: "google/gemini-3.8-flash"
+    )
+    let backend = try OpenAICompatibleBackend(client: client, statusLine: statusLine)
+
+    // Initial context length defaults to model heuristic (1M for Gemini)
+    XCTAssertEqual(backend.capabilities.maxContextLength, 1_048_576)
+
+    // Fallback heuristic verification
+    XCTAssertEqual(client.fallbackContextLength(for: "google/gemini-3.8-flash"), 1_048_576)
+    XCTAssertEqual(client.fallbackContextLength(for: "anthropic/claude-3.7-sonnet"), 200_000)
+    XCTAssertEqual(client.fallbackContextLength(for: "deepseek/deepseek-r1"), 163_840)
+    XCTAssertEqual(client.fallbackContextLength(for: "gpt-4o"), 128_000)
   }
 }

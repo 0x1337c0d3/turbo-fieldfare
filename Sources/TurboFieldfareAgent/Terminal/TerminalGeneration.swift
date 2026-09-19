@@ -27,12 +27,28 @@ final class TerminalGeneration: @unchecked Sendable {
     keyboard.setEventHandler { [weak self] in self?.readKeys() }
     self.keyboard = keyboard
     keyboard.resume()
+    startSpinner()
+  }
+
+  func beginGeneration() {
+    let shouldStart = lock.withLock {
+      guard keyboard != nil, !cancellation.isCancelled else { return false }
+      hasText = false
+      return true
+    }
+    if shouldStart {
+      startSpinner()
+    }
+  }
+
+  private func startSpinner() {
+    spinner?.cancel()
     spinner = Task { [weak self] in
       let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
       var index = 0
       while let self, !Task.isCancelled {
         let drawn = self.lock.withLock {
-          guard self.active, !self.hasText else { return false }
+          guard self.active, !self.hasText, !self.cancellation.isCancelled else { return false }
           AgentTerminal.write(
             "\r\u{001B}[34m\(frames[index % frames.count]) Thinking...\u{001B}[0m\u{001B}[K")
           return true
@@ -49,6 +65,7 @@ final class TerminalGeneration: @unchecked Sendable {
       if key == .toggleTools {
         lock.withLock {
           waitingForSecondCtrlC = false
+          flushThoughtIfNeeded()
           AgentTerminal.navigate(0, promptRows: 0)
         }
       } else if key == .interrupt {
@@ -65,9 +82,15 @@ final class TerminalGeneration: @unchecked Sendable {
         terminalPrint("\n[Press ctrl-c again to exit]")
         cancellation.cancel()
       } else if key == .stop {
+        let shouldNotify = lock.withLock {
+          let wasActive = active
+          active = false
+          return wasActive
+        }
         cancellation.cancel()
-        lock.withLock { active = false }
-        terminalPrint("\n[Generation Stopped (ESC)]")
+        if shouldNotify {
+          terminalPrint("\n[Generation Stopped (ESC)]")
+        }
       } else {
         lock.withLock { waitingForSecondCtrlC = false }
       }
@@ -109,10 +132,12 @@ final class TerminalGeneration: @unchecked Sendable {
   }
 
   private func flushThoughtIfNeeded() {
-    guard !thoughtFlushed, !thoughtBuffer.isEmpty else { return }
+    guard !thoughtBuffer.isEmpty else { return }
+    let text = thoughtBuffer
+    thoughtBuffer = ""
     thoughtFlushed = true
     if keyboard != nil { AgentTerminal.write("\r\u{001B}[K") }
-    AgentTerminal.thought(thoughtBuffer)
+    AgentTerminal.thought(text)
   }
 
   func text(_ text: String) {
@@ -124,27 +149,34 @@ final class TerminalGeneration: @unchecked Sendable {
     }
   }
 
-  func finish() async {
-    lock.withLock {
-      flushThoughtIfNeeded()
-      active = false
-    }
+  func finishGeneration() async {
     spinner?.cancel()
     await spinner?.value
     lock.withLock {
+      flushThoughtIfNeeded()
       if hasText {
         terminalPrint("")
       } else if keyboard != nil {
         AgentTerminal.write("\r\u{001B}[K")
       }
+      hasText = false
     }
   }
 
+  func finish() async {
+    await finishGeneration()
+  }
+
   func restore() {
+    spinner?.cancel()
     lock.withLock {
       guard let keyboard else { return }
       keyboard.cancel()
       self.keyboard = nil
+      active = false
+      if cancellation.isCancelled {
+        tcflush(STDIN_FILENO, TCIFLUSH)
+      }
       _ = fcntl(STDIN_FILENO, F_SETFL, originalFlags)
       tcsetattr(STDIN_FILENO, TCSANOW, &originalTermios)
     }

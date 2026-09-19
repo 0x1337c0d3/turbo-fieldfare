@@ -5,14 +5,17 @@ enum ConversationTurn {
   static func run(
     messages: inout [GFTokenizer.Message],
     maximumRounds: Int = 32,
+    cancellation: AgentCancellation? = nil,
     generate: ([GFTokenizer.Message]) async throws -> (content: String, calls: [ParsedToolCall]),
-    execute: (ParsedToolCall) async -> String
+    execute: (ParsedToolCall) async throws -> String
   ) async throws -> String {
     var emptyContentRetries = 0
     let totalRounds = max(0, maximumRounds)
     for round in 0..<totalRounds {
       try Task.checkCancellation()
+      try cancellation?.check()
       let (content, calls) = try await generate(messages)
+      try cancellation?.check()
       let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
       if calls.isEmpty {
         if trimmed.isEmpty && emptyContentRetries < 2 {
@@ -25,7 +28,7 @@ enum ConversationTurn {
             GFTokenizer.Message(
               role: .user,
               content:
-                "You completed your internal analysis, but did not emit any tool calls or content. You MUST create the requested deliverable file now using write_file (implementing your best-effort solution if an optimal one cannot be proven), run it, and report your results. Do not stop without creating the deliverable file.",
+                "You completed your internal analysis, but did not emit any tool calls or content. Please conclude your analysis and provide your response or next step.",
               toolCalls: [], toolCallID: nil, name: nil))
           continue
         }
@@ -43,12 +46,15 @@ enum ConversationTurn {
           toolCallID: nil, name: nil))
       let remainingRounds = totalRounds - (round + 1)
       for (index, call) in calls.enumerated() {
-        var result = await execute(call)
+        try Task.checkCancellation()
+        try cancellation?.check()
+        var result = try await execute(call)
+        try cancellation?.check()
         if index == calls.count - 1 && remainingRounds > 0 && remainingRounds <= 4 {
           let urgency =
             remainingRounds == 1
-            ? "[CRITICAL Turn Budget Notice: This is your LAST allowed tool round. You MUST call write_file now to create the final deliverable file and complete the requested task.]"
-            : "[Turn Budget Notice: \(remainingRounds) round\(remainingRounds == 1 ? "" : "s") remaining before forced termination. Finish scratchpad exploration immediately and write your final deliverable files (`write_file`) now.]"
+            ? "[CRITICAL Turn Budget Notice: This is your LAST allowed tool round. Conclude your actions and provide your final response to the user.]"
+            : "[Turn Budget Notice: \(remainingRounds) round\(remainingRounds == 1 ? "" : "s") remaining before budget limit. Please conclude any pending actions and prepare your final response.]"
           result += "\n\n" + urgency
         }
         messages.append(

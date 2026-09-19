@@ -210,10 +210,10 @@ def main():
         executable = directory / 'transcript'
         subprocess.run(['swiftc', '-module-cache-path', str(directory / 'module-cache'),
                         '-import-objc-header', str(include / 'AgentLineEditor.h'),
-                        str(ROOT / 'Sources/TurboFieldfareAgent/TerminalText.swift'),
-                        str(ROOT / 'Sources/TurboFieldfareAgent/TerminalTranscript.swift'),
-                        str(ROOT / 'Sources/TurboFieldfareAgent/StatusLine.swift'),
-                        str(ROOT / 'Sources/TurboFieldfareAgent/TerminalGeneration.swift'),
+                        str(ROOT / 'Sources/TurboFieldfareAgent/Terminal/TerminalText.swift'),
+                        str(ROOT / 'Sources/TurboFieldfareAgent/Terminal/TerminalTranscript.swift'),
+                        str(ROOT / 'Sources/TurboFieldfareAgent/Terminal/StatusLine.swift'),
+                        str(ROOT / 'Sources/TurboFieldfareAgent/Terminal/TerminalGeneration.swift'),
                         str(source), str(editor), '-ledit', '-o', str(executable)], check=True)
         for number, (name, draft, toggle, expected) in enumerate(cases):
             terminal = TranscriptTerminal(executable, directory / f'history-{number}')
@@ -273,18 +273,17 @@ def main():
                 if len(key) > 1:
                     time.sleep(0.005)
                     terminal.send(key[1:])
-                terminal.read_until(b'\x1b[1;1H')
-                terminal.read_until(b'STREAMING_BEGIN')
+                terminal.read_until(b'Output expanded')
+                terminal.read_until(b'EXPANDED_PAYLOAD')
                 assert 'EXPANDED_PAYLOAD' in terminal.screen.text, terminal.screen.text
+                assert b'\x1b[1;1H' not in terminal.buffer, "Generation toggle must not wipe screen with cursor home"
                 terminal.send(key)
-                terminal.read_until(b'\x1b[1;1H')
-                terminal.read_until(b'STREAMING_BEGIN')
-                assert 'EXPANDED_PAYLOAD' not in terminal.screen.text
+                terminal.read_until(b'Output collapsed')
                 terminal.send(b'\x1b')
                 terminal.read_until(b'GENERATION_FINISHED')
                 assert terminal.process.wait(timeout=5) == 0
                 assert termios.tcgetattr(terminal.master) == terminal.original_mode
-                print(f'PASS: generation shortcut {number + 1}, retained streamed text, Escape, terminal restoration')
+                print(f'PASS: generation shortcut {number + 1}, inline expand/collapse without screen wipe, Escape, terminal restoration')
             finally:
                 terminal.close()
         terminal = TranscriptTerminal(executable, directory / 'resize')

@@ -37,15 +37,19 @@ enum AgentTerminal {
     }
   }
 
-  static func toolResult(_ result: String, limit: Int) {
+  static func toolResult(header: String, result: String, limit: Int) {
     lock.withLock {
-      if let text = transcript?.appendTool(result, limit: limit) {
+      if var t = transcript {
+        let text = t.appendTool(header: header, result: result)
+        transcript = t
         write(text)
       } else {
-        let limit = max(0, limit)
-        let suffix = result.count > limit ? "..." : ""
+        // Non-TUI path (pipe / dumb terminal): print header then a short preview.
+        write("\u{001B}[32m\n● \(TerminalText.safe(header))\u{001B}[0m\n")
+        let cap = max(0, limit)
+        let suffix = result.count > cap ? "..." : ""
         write(
-          "\u{001B}[33m   \(TerminalText.safe(String(result.prefix(limit))))\(suffix)\u{001B}[0m\n")
+          "\u{001B}[33m   \(TerminalText.safe(String(result.prefix(cap))))\(suffix)\u{001B}[0m\n")
       }
     }
   }
@@ -87,14 +91,30 @@ enum AgentTerminal {
     return lock.withLock {
       guard let size, transcript?.hasTools == true else { return false }
       if action == 0 {
-        transcript?.toggle()
+        toggle(promptRows: promptRows)
+        return true
       } else {
         let page = max(1, size.rows - 1 - promptRows)
         transcript?.scrollOffset += action < 0 ? page : -page
+        repaint(promptRows: promptRows)
       }
-      repaint(promptRows: promptRows)
       return true
     }
+  }
+
+  static var isExpanded: Bool {
+    lock.withLock { transcript?.expanded ?? false }
+  }
+
+  /// Toggle expand/collapse for tool outputs and thinking blocks, then fully
+  /// repaint the TUI. Always does a complete redraw so the viewport is correct
+  /// in both states — during active generation (promptRows == 0) and at the
+  /// interactive prompt (promptRows > 0).
+  private static func toggle(promptRows: Int) {
+    guard size != nil, var content = transcript else { return }
+    content.toggle()
+    transcript = content
+    repaint(promptRows: promptRows)
   }
 
   private static func repaint(promptRows: Int) {
@@ -147,14 +167,21 @@ struct AgentStatusSnapshot {
   var memoryBytes: UInt64?
   var contextTokens = 0
   var maxContext = 0
+  var modelLabel = ""
 
   func text(width: Int) -> String {
     let rate =
       tokensPerSecond.flatMap { $0.isFinite && $0 >= 0 ? String(format: "%.1f", $0) : nil } ?? "--"
     let memory = memoryBytes.map { String(format: "%.2f GiB", Double($0) / 1_073_741_824) } ?? "--"
-    let text = " \(phase) | \(rate) tok/s | RAM \(memory) | ctx \(contextTokens)/\(maxContext)"
+    let left = " \(phase) | \(rate) tok/s | RAM \(memory) | ctx \(contextTokens)/\(maxContext)"
     // Leave the last column unused to avoid automatic line wrapping.
-    return String(text.prefix(max(0, width - 1)))
+    let maxWidth = max(0, width - 1)
+    let right = modelLabel.isEmpty ? "" : "\(modelLabel) "
+    let gap = maxWidth - left.count - right.count
+    if !right.isEmpty && gap >= 1 {
+      return left + String(repeating: " ", count: gap) + right
+    }
+    return String(left.prefix(maxWidth))
   }
 }
 

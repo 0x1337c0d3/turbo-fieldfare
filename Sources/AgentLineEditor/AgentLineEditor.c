@@ -99,6 +99,16 @@ static unsigned char insert_newline(EditLine *editor, int key) {
     return el_insertstr(editor, "\n") == 0 ? CC_REFRESH : CC_ERROR;
 }
 
+static unsigned char delete_char(EditLine *editor, int key) {
+    (void)key;
+    const LineInfo *line = el_line(editor);
+    if (line->buffer == line->lastchar) {
+        return CC_EOF;
+    }
+    el_push(editor, "\033[90~");
+    return CC_NORM;
+}
+
 static unsigned char move_to_boundary(EditLine *editor, int end) {
     const LineInfoW *line = el_wline(editor);
     const wchar_t *target = line->cursor;
@@ -127,6 +137,35 @@ static unsigned char move_to_start(EditLine *editor, int key) {
 static unsigned char move_to_end(EditLine *editor, int key) {
     (void)key;
     return move_to_boundary(editor, 1);
+}
+
+static unsigned char delete_line(EditLine *editor, int key) {
+    (void)key;
+    const LineInfoW *line = el_wline(editor);
+    const wchar_t *start = line->cursor;
+    const wchar_t *end = line->cursor;
+    while (start > line->buffer && start[-1] != L'\n') start--;
+    while (end < line->lastchar && *end != L'\n') end++;
+
+    size_t right_count = (size_t)(end - line->cursor);
+    size_t left_count = (size_t)(line->cursor - start);
+
+    // If cursor is not at line end, move to end of current line first.
+    if (right_count > 0) {
+        char *movement = malloc(right_count + 1);
+        if (!movement) return CC_ERROR;
+        memset(movement, '\006', right_count); // ^F (forward)
+        movement[right_count] = '\0';
+        el_push(editor, movement);
+        free(movement);
+    }
+
+    // Delete all characters in the line.
+    size_t total_line_chars = left_count + right_count;
+    if (total_line_chars > 0) {
+        el_wdeletestr(editor, (int)total_line_chars);
+    }
+    return CC_REFRESH;
 }
 
 static unsigned char transcript_action(EditLine *editor, int action) {
@@ -186,6 +225,7 @@ static void configure_keys(EditLine *editor) {
     el_set(editor, EL_ADDFN, "agent-newline", "Insert a newline", insert_newline);
     el_set(editor, EL_ADDFN, "agent-start", "Start of current line", move_to_start);
     el_set(editor, EL_ADDFN, "agent-end", "End of current line", move_to_end);
+    el_set(editor, EL_ADDFN, "agent-delete-line", "Delete current line", delete_line);
     el_set(editor, EL_ADDFN, "agent-cancel", "Clear the prompt", cancel_prompt);
     el_set(editor, EL_ADDFN, "agent-finish-cancel", "Finish clearing the prompt", finish_cancel);
     el_set(editor, EL_ADDFN, "agent-toggle-tools", "Expand/collapse tool responses", toggle_tools);
@@ -205,8 +245,45 @@ static void configure_keys(EditLine *editor) {
     bind_key(editor, "^C", "agent-cancel");
     bind_key(editor, "^[[99;5u", "agent-cancel");
     bind_key(editor, "^[[27;5;99~", "agent-cancel");
+    el_set(editor, EL_ADDFN, "agent-delete-char", "Delete character under cursor or EOF", delete_char);
+    bind_key(editor, "^[[90~", "ed-delete-next-char");
+    bind_key(editor, "^D", "agent-delete-char");
+    bind_key(editor, "^[[100;5u", "agent-delete-char");
+    bind_key(editor, "^[[27;5;100~", "agent-delete-char");
+    bind_key(editor, "^[[3~", "ed-delete-next-char");
+    bind_key(editor, "^[[3;5~", "ed-delete-next-char");
+    bind_key(editor, "^[[3;2~", "ed-delete-next-char");
+    bind_key(editor, "^[[3;9~", "agent-delete-line"); // Cmd-Delete (Forward Delete)
+    bind_key(editor, "^[[3;10~", "agent-delete-line");
+    bind_key(editor, "^[[3;13~", "agent-delete-line");
+    bind_key(editor, "^[[127;9u", "agent-delete-line"); // Cmd-Delete / Cmd-Backspace (Kitty)
+    bind_key(editor, "^[[127;10u", "agent-delete-line");
+    bind_key(editor, "^[[127;13u", "agent-delete-line");
+    bind_key(editor, "^[[8;9u", "agent-delete-line"); // Cmd-Backspace (Kitty BS)
+    bind_key(editor, "^[[8;10u", "agent-delete-line");
+    bind_key(editor, "^[[8;13u", "agent-delete-line");
+    bind_key(editor, "^[[27;9;127~", "agent-delete-line"); // Cmd-Backspace (XTerm)
+    bind_key(editor, "^[[27;13;127~", "agent-delete-line");
+    bind_key(editor, "^[[27;9;8~", "agent-delete-line");
+    bind_key(editor, "^[[27;13;8~", "agent-delete-line");
     bind_key(editor, "^B", "ed-prev-char");
+    bind_key(editor, "^[[98;5u", "ed-prev-char");
+    bind_key(editor, "^[[27;5;98~", "ed-prev-char");
     bind_key(editor, "^F", "ed-next-char");
+    bind_key(editor, "^[[102;5u", "ed-next-char");
+    bind_key(editor, "^[[27;5;102~", "ed-next-char");
+    bind_key(editor, "^W", "ed-delete-prev-word");
+    bind_key(editor, "^[[119;5u", "ed-delete-prev-word");
+    bind_key(editor, "^[[27;5;119~", "ed-delete-prev-word");
+    bind_key(editor, "^K", "ed-kill-line");
+    bind_key(editor, "^[[107;5u", "ed-kill-line");
+    bind_key(editor, "^[[27;5;107~", "ed-kill-line");
+    bind_key(editor, "^U", "vi-kill-line-prev");
+    bind_key(editor, "^[[117;5u", "vi-kill-line-prev");
+    bind_key(editor, "^[[27;5;117~", "vi-kill-line-prev");
+    bind_key(editor, "^L", "ed-clear-screen");
+    bind_key(editor, "^[[108;5u", "ed-clear-screen");
+    bind_key(editor, "^[[27;5;108~", "ed-clear-screen");
     bind_key(editor, "^A", "agent-start");
     bind_key(editor, "^E", "agent-end");
     // Enhanced keyboard mode also changes the encoding of Ctrl shortcuts.

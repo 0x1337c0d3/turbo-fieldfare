@@ -34,34 +34,58 @@ public struct AgentConfig: Sendable {
   public let backend: AgentBackendKind
   public let pccPolicy: PCCPolicy
   public let defaultModelURL: URL
+  public let maxRounds: Int
+  public let explicitMaxRounds: Int?
+
+  public static func findDefaultModel(
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+    workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+  ) -> URL {
+    let candidateModels = [
+      workingDirectory.appendingPathComponent("scratch/gemma4-shared8.gturbo"),
+      workingDirectory.appendingPathComponent("scratch/gemma4.gturbo"),
+      homeDirectory.appendingPathComponent(
+        "Library/Application Support/TurboFieldfare/gemma4-shared8.gturbo"),
+      homeDirectory.appendingPathComponent(
+        "Library/Application Support/TurboFieldfare/gemma4.gturbo"),
+    ]
+    return candidateModels.first(where: { FileManager.default.fileExists(atPath: $0.path) })
+      ?? candidateModels[3]
+  }
 
   public init(
     arguments: [String] = Array(CommandLine.arguments.dropFirst()),
     homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
     workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
   ) throws {
-    let parsed = try Self.parseArguments(arguments, homeDirectory: homeDirectory)
+    let parsed = try Self.parseArguments(
+      arguments, homeDirectory: homeDirectory, workingDirectory: workingDirectory)
     self.args = parsed.args
     self.routingMode = parsed.routingMode
     self.backend = parsed.backend
     self.pccPolicy = parsed.pccPolicy
-    self.defaultModelURL =
-      homeDirectory
-      .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
+    self.maxRounds = parsed.maxRounds
+    self.explicitMaxRounds = parsed.explicitMaxRounds
+    self.defaultModelURL = Self.findDefaultModel(
+      homeDirectory: homeDirectory, workingDirectory: workingDirectory)
     self.systemPrompt = Self.buildSystemPrompt(
       homeDirectory: homeDirectory, workingDirectory: workingDirectory,
       agentsFilePath: parsed.agentsFilePath, systemPromptPath: parsed.systemPromptPath)
   }
 
   private static func parseArguments(
-    _ arguments: [String], homeDirectory: URL
+    _ arguments: [String],
+    homeDirectory: URL,
+    workingDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
   ) throws -> (
     args: Args,
     agentsFilePath: String?,
     systemPromptPath: String?,
     routingMode: String?,
     backend: AgentBackendKind,
-    pccPolicy: PCCPolicy
+    pccPolicy: PCCPolicy,
+    maxRounds: Int,
+    explicitMaxRounds: Int?
   ) {
     var rawArgv = arguments
     var systemPromptPath: String?
@@ -69,6 +93,7 @@ public struct AgentConfig: Sendable {
     var routingMode: String?
     var backendArg: String?
     var pccArg: String?
+    var maxRoundsArg: Int?
     let userSpecifiedModel = rawArgv.contains("--model")
 
     var i = 0
@@ -91,6 +116,12 @@ public struct AgentConfig: Sendable {
         rawArgv.remove(at: i)
       } else if rawArgv[i] == "--pcc", i + 1 < rawArgv.count {
         pccArg = rawArgv[i + 1]
+        rawArgv.remove(at: i)
+        rawArgv.remove(at: i)
+      } else if rawArgv[i] == "--max-rounds", i + 1 < rawArgv.count {
+        if let val = Int(rawArgv[i + 1]), val > 0 {
+          maxRoundsArg = val
+        }
         rawArgv.remove(at: i)
         rawArgv.remove(at: i)
       } else {
@@ -124,9 +155,8 @@ public struct AgentConfig: Sendable {
       pccPolicy = .auto
     }
 
-    let defaultModel =
-      homeDirectory
-      .appendingPathComponent("Library/Application Support/TurboFieldfare/gemma4.gturbo")
+    let defaultModel = Self.findDefaultModel(
+      homeDirectory: homeDirectory, workingDirectory: workingDirectory)
     if !rawArgv.contains("--model") {
       if backend == .gemma {
         rawArgv.append(contentsOf: ["--model", defaultModel.path])
@@ -135,7 +165,10 @@ public struct AgentConfig: Sendable {
       }
     }
 
-    if !rawArgv.contains("--max-context") {
+    // Apple Foundation Models report their own context window at runtime via
+    // model.contextSize; injecting --max-context here would set a misleading
+    // value unrelated to the real AFM limit (8 K Core / 32 K Cloud Pro).
+    if !rawArgv.contains("--max-context"), backend != .apple {
       rawArgv.append(contentsOf: ["--max-context", "262144"])
     }
 
@@ -156,7 +189,11 @@ public struct AgentConfig: Sendable {
       throw error
     }
 
-    return (parsedArgs, agentsFilePath, systemPromptPath, routingMode, backend, pccPolicy)
+    let maxRounds = maxRoundsArg ?? 32
+    return (
+      parsedArgs, agentsFilePath, systemPromptPath, routingMode, backend, pccPolicy, maxRounds,
+      maxRoundsArg
+    )
   }
 
   private static func buildSystemPrompt(
@@ -216,7 +253,7 @@ public struct AgentConfig: Sendable {
     masterSystemPrompt += "MCP tools are available and can be called natively.\n\n"
     masterSystemPrompt += "## Autonomous Execution Policy\n"
     masterSystemPrompt +=
-      "You are an autonomous software engineering agent. If a user prompt, workflow description, or task suggests pausing for human review (such as 'after review of the documentation'), do NOT pause or halt your turn to wait for confirmation. Instead, proceed directly to implementation and validation. Always create the requested deliverable files using `write_file`. Even if an optimal or deterministic algorithm has not been mathematically proven, you must still write your best-effort implementation to the requested destination file, run tests or code to verify its behavior, and report your findings. Never abandon file creation or exit with an empty turn without creating the requested files."
+      "You are an autonomous software engineering agent. If a user prompt, workflow description, or task suggests pausing for human review (such as 'after review of the documentation'), do NOT pause or halt your turn to wait for confirmation. Instead, proceed directly to implementation, testing, and validation. When deliverables or file modifications are requested, create or update them directly, verify their behavior, and report your results. Be proactive, thorough, and autonomous."
 
     if masterSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       masterSystemPrompt = "You are a native Swift agent. You can execute tools natively.\n"
