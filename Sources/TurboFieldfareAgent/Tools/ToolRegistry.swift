@@ -7,10 +7,17 @@ struct ToolRegistry {
   nonisolated(unsafe) static var mcpTools: Set<String> = []
   private static let scratchpadLock = NSLock()
   nonisolated(unsafe) private static var scratchpadInvocations = 0
+  private static let searchHistoryLock = NSLock()
+  nonisolated(unsafe) private static var consecutiveEmptySearches = 0
+  nonisolated(unsafe) private static var lastEmptySearchPath = ""
 
   static func resetTurnState() {
     scratchpadLock.withLock {
       scratchpadInvocations = 0
+    }
+    searchHistoryLock.withLock {
+      consecutiveEmptySearches = 0
+      lastEmptySearchPath = ""
     }
   }
   static let baseDefinitions: [GFTokenizer.FunctionDefinition] = [
@@ -132,7 +139,8 @@ struct ToolRegistry {
     ),
     GFTokenizer.FunctionDefinition(
       name: "grep_search",
-      description: "Search for exact text matches or regular expressions within files.",
+      description:
+        "Searches for exact text substring matches within files or directories. Note: this uses exact substring matching, not regular expressions. To inspect a specific known file, prefer read_file.",
       parameters: .object([
         "type": .string("object"),
         "properties": .object([
@@ -282,11 +290,9 @@ struct ToolRegistry {
   static func execute(
     call: ParsedToolCall, runtime: AgentRuntime,
     context suppliedContext: AgentToolContext? = nil
-  ) async -> String {
+  ) async throws -> String {
     let context = suppliedContext ?? .terminal(runtime)
-    if context.interaction?.cancellation.isCancelled == true || Task.isCancelled {
-      return "Error: cancelled"
-    }
+    try context.cancellation.check()
     guard runtime.remainingToolCalls > 0 else {
       return "Error: tool-call budget exhausted for this user turn"
     }
@@ -305,48 +311,47 @@ struct ToolRegistry {
       return
         "Tool call denied by the user or unavailable in non-interactive mode. Do not retry without a new user request."
     }
-    if context.interaction?.cancellation.isCancelled == true || Task.isCancelled {
-      return "Error: cancelled"
-    }
+    try context.cancellation.check()
     context.interaction?.tool(call, "in_progress", nil)
+    let result: String
     switch call.name {
     case "invoke_subagent":
-      return await executeInvokeSubagent(call: call, runtime: runtime, context: context)
+      result = try await executeInvokeSubagent(call: call, runtime: runtime, context: context)
     case "web_search":
-      return await executeWebSearch(call: call)
+      result = try await executeWebSearch(call: call, context: context)
     case "read_url":
-      return await executeReadURL(call: call)
+      result = try await executeReadURL(call: call, context: context)
     case "read_file":
-      return await executeReadFile(call: call, context: context)
+      result = try await executeReadFile(call: call, context: context)
     case "write_file":
-      return await executeWriteFile(call: call, context: context)
+      result = try await executeWriteFile(call: call, context: context)
     case "edit_file":
-      return await executeEditFile(call: call, context: context)
+      result = try await executeEditFile(call: call, context: context)
     case "execute_bash":
-      return await executeBash(call: call, context: context)
+      result = try await executeBash(call: call, context: context)
     case "python_scratchpad":
-      return await executePythonScratchpad(call: call, context: context)
+      result = try await executePythonScratchpad(call: call, context: context)
     case "list_dir":
-      return await executeListDir(call: call, context: context)
+      result = try await executeListDir(call: call, context: context)
     case "find_by_name":
-      return await executeFindByName(call: call, context: context)
+      result = try await executeFindByName(call: call, context: context)
     case "grep_search":
-      return await executeGrepSearch(call: call, context: context)
+      result = try await executeGrepSearch(call: call, context: context)
     case "analyze_image":
-      return await executeAnalyzeImage(call: call, context: context)
+      result = await executeAnalyzeImage(call: call, context: context)
     case "define_subagent":
       guard let name = call.stringArgument("name"),
         let prompt = call.stringArgument("system_prompt")
       else { return "Error" }
       await AgentManager.shared.defineSubagent(name: name, prompt: prompt)
-      return "Subagent \(name) defined."
+      result = "Subagent \(name) defined."
     case "manage_subagents":
-      return await AgentManager.shared.listSubagents()
+      result = await AgentManager.shared.listSubagents()
     case "send_message":
       guard let id = call.stringArgument("id"), let msg = call.stringArgument("message") else {
         return "Error"
       }
-      return await AgentManager.shared.sendMessage(id: id, message: msg)
+      result = await AgentManager.shared.sendMessage(id: id, message: msg)
     case "schedule":
       guard let duration = call.intArgument("duration_seconds"),
         let prompt = call.stringArgument("prompt")
@@ -357,9 +362,9 @@ struct ToolRegistry {
         try? await Task.sleep(nanoseconds: UInt64(duration) * 1_000_000_000)
         print("\n[Timer Fired]: \(prompt)")
       }
-      return "Scheduled task \(id)"
+      result = "Scheduled task \(id)"
     case "manage_task":
-      return await AgentManager.shared.listTasks()
+      result = await AgentManager.shared.listTasks()
     default:
       if let memoryService = context.memoryService,
         await memoryService.toolDefinitions().contains(where: { $0.name == call.name })
@@ -371,24 +376,26 @@ struct ToolRegistry {
         do {
           let data = call.argumentsJSON.data(using: .utf8)!
           let dict = try JSONDecoder().decode([String: MemoryToolValue].self, from: data)
-          let result = await memoryService.execute(name: call.name, arguments: dict, in: session)
-          return result.jsonString()
-
+          let memResult = await memoryService.execute(name: call.name, arguments: dict, in: session)
+          result = memResult.jsonString()
         } catch {
-          return "Error parsing memory tool args: \(error)"
+          result = "Error parsing memory tool args: \(error)"
         }
+      } else if isMCPTool(call.name, definitions: context.definitions) {
+        result = await executeMCP(call: call, mcp: context.mcp)
+      } else {
+        result = "Error: unknown tool"
       }
-      if isMCPTool(call.name, definitions: context.definitions) {
-        return await executeMCP(call: call, mcp: context.mcp)
-      }
-      return "Error: unknown tool"
     }
+    try context.cancellation.check()
+    return result
   }
 
   private static func executeInvokeSubagent(
     call: ParsedToolCall, runtime: AgentRuntime,
     context: AgentToolContext
-  ) async -> String {
+  ) async throws -> String {
+    try context.cancellation.check()
     guard runtime.subagentDepth < 4 else { return "Error: subagent nesting limit reached" }
     runtime.subagentDepth += 1
     defer { runtime.subagentDepth -= 1 }
@@ -405,6 +412,8 @@ struct ToolRegistry {
     do {
       return try await AgentTurn.run(
         runtime: runtime, messages: &messages, context: context, resultLimit: 200)
+    } catch is CancellationError {
+      throw CancellationError()
     } catch { return "Error: subagent failed: \(error)" }
   }
 
@@ -418,7 +427,10 @@ struct ToolRegistry {
     return await mcp.callTool(name: call.name, argsJson: argsJson)
   }
 
-  private static func executeWebSearch(call: ParsedToolCall) async -> String {
+  private static func executeWebSearch(call: ParsedToolCall, context: AgentToolContext) async throws
+    -> String
+  {
+    try context.cancellation.check()
     guard let query = call.stringArgument("query"),
       let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
     else {
@@ -429,6 +441,7 @@ struct ToolRegistry {
 
     // 1. DuckDuckGo Instant Answers
     if let ddgURL = URL(string: "https://api.duckduckgo.com/?q=\(encoded)&format=json") {
+      try context.cancellation.check()
       if let (data, _) = try? await URLSession.shared.data(from: ddgURL),
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
       {
@@ -446,6 +459,7 @@ struct ToolRegistry {
       string:
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=\(encoded)&format=json&utf8=1"
     ) {
+      try context.cancellation.check()
       var request = URLRequest(url: wikiURL)
       request.setValue("TurboFieldfareAgent/1.0", forHTTPHeaderField: "User-Agent")
       if let (data, _) = try? await URLSession.shared.data(for: request),
@@ -471,6 +485,7 @@ struct ToolRegistry {
       }
     }
 
+    try context.cancellation.check()
     guard !results.isEmpty else {
       return "No web search results found for '\(query)'."
     }
@@ -478,12 +493,16 @@ struct ToolRegistry {
     return results.joined(separator: "\n\n")
   }
 
-  private static func executeReadURL(call: ParsedToolCall) async -> String {
+  private static func executeReadURL(call: ParsedToolCall, context: AgentToolContext) async throws
+    -> String
+  {
+    try context.cancellation.check()
     guard let urlString = call.stringArgument("url"), let url = URL(string: urlString) else {
       return "Error: invalid URL"
     }
     do {
       let (data, response) = try await URLSession.shared.data(from: url)
+      try context.cancellation.check()
       guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode)
       else {
         return "Error: Bad HTTP response"
@@ -493,39 +512,48 @@ struct ToolRegistry {
         return "Error: Unable to decode text"
       }
       return ReadableHTML.text(from: html)
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error fetching URL: \(error)"
     }
   }
 
-  private static func executeReadFile(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeReadFile(call: ParsedToolCall, context: AgentToolContext) async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
     do {
       return try await readFile(context.path(path), context: context)
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error reading file: \(error)"
     }
   }
 
-  private static func executeWriteFile(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeWriteFile(call: ParsedToolCall, context: AgentToolContext) async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path"),
       let content = call.stringArgument("content")
     else { return "Error: invalid arguments" }
     do {
       try await writeFile(context.path(path), content: content, context: context)
       return "Successfully wrote to \(path)"
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error writing file: \(error)"
     }
   }
 
-  private static func executeEditFile(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeEditFile(call: ParsedToolCall, context: AgentToolContext) async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path"),
       let target = call.stringArgument("target"),
       let replacement = call.stringArgument("replacement")
@@ -534,16 +562,22 @@ struct ToolRegistry {
     }
     do {
       let content = try await readFile(context.path(path), context: context)
-      guard content.contains(target) else { return "Error: target string not found in file" }
+      guard content.contains(target) else {
+        return
+          "Error: target string not found in \(path). Please ensure 'target' matches the exact content and indentation from 'read_file'."
+      }
       let updated = content.replacingOccurrences(of: target, with: replacement)
       try await writeFile(context.path(path), content: updated, context: context)
       return "Successfully updated \(path)"
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error editing file: \(error)"
     }
   }
 
   private static func readFile(_ path: String, context: AgentToolContext) async throws -> String {
+    try context.cancellation.check()
     if let read = context.interaction?.readFile { return try await read(path) }
     return try String(contentsOfFile: path, encoding: .utf8)
   }
@@ -551,7 +585,7 @@ struct ToolRegistry {
   private static func writeFile(_ path: String, content: String, context: AgentToolContext)
     async throws
   {
-    try context.interaction?.cancellation.check()
+    try context.cancellation.check()
     if let write = context.interaction?.writeFile {
       try await write(path, content)
       return
@@ -559,8 +593,27 @@ struct ToolRegistry {
     try content.write(toFile: path, atomically: true, encoding: .utf8)
   }
 
-  private static func executeBash(call: ParsedToolCall, context: AgentToolContext) async -> String {
-    guard let command = call.stringArgument("command") else { return "Error: invalid arguments" }
+  private static func executeBash(call: ParsedToolCall, context: AgentToolContext) async throws
+    -> String
+  {
+    try context.cancellation.check()
+    let commandCandidate =
+      call.stringArgument("command")
+      ?? call.stringArgument("cmd")
+      ?? call.stringArgument("command_line")
+      ?? call.stringArgument("arguments")
+    let command: String
+    if let cmd = commandCandidate {
+      command = cmd
+    } else if case .object(let dict) = call.arguments,
+      case .array(let arr) = dict["arguments"]
+    {
+      command = arr.compactMap {
+        if case .string(let s) = $0 { return s } else { return nil }
+      }.joined(separator: " ")
+    } else {
+      return "Error: invalid arguments"
+    }
     let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.range(of: #"(?i)cat\s*<<\s*\\?['"]?[A-Za-z0-9_]+['"]?"#, options: .regularExpression)
       != nil
@@ -570,18 +623,22 @@ struct ToolRegistry {
     }
     do {
       let output = try await ShellCommand.run(
-        command, directory: context.directory, cancellation: context.interaction?.cancellation)
+        command, directory: context.directory, cancellation: context.cancellation)
       guard output.count > 8192 else { return output }
       return String(output.prefix(8192))
         + "\n... (output truncated: too large for context window. please use grep, head, or tail to narrow it down)"
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error: \(error)"
     }
   }
 
-  private static func executePythonScratchpad(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executePythonScratchpad(call: ParsedToolCall, context: AgentToolContext)
+    async throws
     -> String
   {
+    try context.cancellation.check()
     guard let code = call.stringArgument("code") else {
       return "Error: invalid arguments: 'code' string required"
     }
@@ -596,7 +653,7 @@ struct ToolRegistry {
       defer { try? FileManager.default.removeItem(at: tempFile) }
       let rawOutput = try await ShellCommand.run(
         "python3 \"\(tempFile.path)\"", directory: context.directory,
-        cancellation: context.interaction?.cancellation)
+        cancellation: context.cancellation)
       let baseOutput: String
       if rawOutput.count > 8192 {
         baseOutput = String(rawOutput.prefix(8192)) + "\n... (output truncated)"
@@ -604,56 +661,109 @@ struct ToolRegistry {
         baseOutput = rawOutput.isEmpty ? "(Executed successfully with no output)" : rawOutput
       }
       var notice =
-        "\n\n[Sandbox note: Code executed in python_scratchpad is ephemeral and NOT saved to disk. To complete the task, you must call `write_file` to save your verified solution to the requested destination file in the workspace.]"
+        "\n\n[Sandbox note: Code executed in python_scratchpad is ephemeral and NOT saved to disk. To persist code or changes to the project, use `write_file`.]"
       if count >= 3 {
         notice +=
-          "\n[Notice: You have used python_scratchpad \(count) times. Avoid endless trial-and-error simulation loops. If empirical testing has not proven a guaranteed solution, use `web_search` to find the exact algorithm/puzzle theory, write an exhaustive state-space search script across all states, or proceed to create the required deliverable files using `write_file`.]"
+          "\n[Notice: You have used python_scratchpad \(count) times. Avoid endless simulation loops; proceed to implement and verify your solution in the workspace.]"
       }
       return baseOutput + notice
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error executing scratchpad: \(error)"
     }
   }
 
-  private static func executeListDir(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeListDir(call: ParsedToolCall, context: AgentToolContext) async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path") else { return "Error: invalid arguments" }
     do {
       let contents = try FileManager.default.contentsOfDirectory(atPath: context.path(path))
       return contents.joined(separator: "\n")
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error listing directory: \(error)"
     }
   }
 
-  private static func executeFindByName(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeFindByName(call: ParsedToolCall, context: AgentToolContext)
+    async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path"), let pattern = call.stringArgument("pattern")
     else { return "Error: invalid arguments" }
     do {
       let output = try await ShellCommand.run(
         "find \"\(context.path(path))\" -name \"\(pattern)\"", directory: context.directory,
-        cancellation: context.interaction?.cancellation)
+        cancellation: context.cancellation)
       return output.isEmpty ? "No files found matching \(pattern)" : output
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error finding files: \(error)"
     }
   }
 
-  private static func executeGrepSearch(call: ParsedToolCall, context: AgentToolContext) async
+  private static func executeGrepSearch(call: ParsedToolCall, context: AgentToolContext)
+    async throws
     -> String
   {
+    try context.cancellation.check()
     guard let path = call.stringArgument("path"), let query = call.stringArgument("query") else {
       return "Error: invalid arguments"
     }
+    // Use -F (fixed string) so special characters like [ ] don't cause regex errors.
+    // Wrap in `sh -c '... ; exit 0'` so grep's exit 1 (no matches) doesn't trigger
+    // ShellCommand's [Exit status: N] annotation — exit 1 is not an error.
+    let absPath = context.path(path)
+    // Shell-escape single quotes in path.
+    let safePath = absPath.replacingOccurrences(of: "'", with: "'\\''")
+    // Shell-escape single quotes in query.
+    let safeQuery = query.replacingOccurrences(of: "'", with: "'\\''")
+    let command = "grep -rInF '\(safeQuery)' '\(safePath)' || true"
     do {
-      let output = try await ShellCommand.run(
-        "grep -rnI \"\(query)\" \"\(context.path(path))\"", directory: context.directory,
-        cancellation: context.interaction?.cancellation)
-      guard output.count > 8192 else { return output.isEmpty ? "No matches found" : output }
-      return String(output.prefix(8192)) + "\n... (output truncated)"
+      let raw = try await ShellCommand.run(
+        command, directory: context.directory,
+        cancellation: context.cancellation)
+      // Strip any residual [Exit status: N] trailer.
+      let lines = raw.components(separatedBy: "\n").filter {
+        !$0.hasPrefix("[Exit status:") && !$0.hasPrefix("[Output truncated")
+      }
+      let trimmed = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty {
+        let count = searchHistoryLock.withLock {
+          if lastEmptySearchPath == path {
+            consecutiveEmptySearches += 1
+          } else {
+            lastEmptySearchPath = path
+            consecutiveEmptySearches = 1
+          }
+          return consecutiveEmptySearches
+        }
+        var msg = "No matches found for '\(query)' in \(path)."
+        if count >= 3 {
+          msg +=
+            "\n\n[Notice: You have performed \(count) consecutive searches with no matches in \(path). Do not loop with repeated grep queries. Use 'read_file' to examine the target file directly, or proceed to implement your edit.]"
+        } else {
+          msg +=
+            " (Note: grep_search uses exact substring matching. If you are searching in a single file, use 'read_file' to view its contents directly.)"
+        }
+        return msg
+      }
+      searchHistoryLock.withLock {
+        consecutiveEmptySearches = 0
+        lastEmptySearchPath = ""
+      }
+      guard trimmed.count <= 8192 else {
+        return String(trimmed.prefix(8192)) + "\n... (output truncated)"
+      }
+      return trimmed
+    } catch is CancellationError {
+      throw CancellationError()
     } catch {
       return "Error running grep: \(error)"
     }

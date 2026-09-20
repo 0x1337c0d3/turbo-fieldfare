@@ -7,13 +7,41 @@ struct AgentToolContext: Sendable {
   let mcp: MCPClient?
   let definitions: [GFTokenizer.FunctionDefinition]
   let interaction: AgentInteraction?
+  let cancellation: AgentCancellation
+  let terminal: TerminalGeneration?
   let memoryService: MemoryService?
 
-  static func terminal(_ runtime: AgentRuntime, memoryService: MemoryService? = nil) -> Self {
+  init(
+    directory: URL,
+    systemPrompt: String,
+    mcp: MCPClient?,
+    definitions: [GFTokenizer.FunctionDefinition],
+    interaction: AgentInteraction? = nil,
+    cancellation: AgentCancellation = AgentCancellation(),
+    terminal: TerminalGeneration? = nil,
+    memoryService: MemoryService? = nil
+  ) {
+    self.directory = directory
+    self.systemPrompt = systemPrompt
+    self.mcp = mcp
+    self.definitions = definitions
+    self.interaction = interaction
+    self.cancellation = cancellation
+    self.terminal = terminal
+    self.memoryService = memoryService
+  }
+
+  static func terminal(
+    _ runtime: AgentRuntime,
+    cancellation: AgentCancellation = AgentCancellation(),
+    terminal: TerminalGeneration? = nil,
+    memoryService: MemoryService? = nil
+  ) -> Self {
     Self(
       directory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
       systemPrompt: runtime.config.systemPrompt, mcp: MCPClient.shared,
-      definitions: ToolRegistry.definitions, interaction: nil, memoryService: memoryService)
+      definitions: ToolRegistry.definitions, interaction: nil,
+      cancellation: cancellation, terminal: terminal, memoryService: memoryService)
   }
 
   func path(_ path: String) -> String {
@@ -44,8 +72,18 @@ enum AgentTurn {
     }
 
     ToolRegistry.resetTurnState()
+    runtime.resetToolBudget()
+    defer {
+      if messages.count > 1, !memoryBootstrap.isEmpty {
+        messages[0] = GFTokenizer.Message(
+          role: .system, content: context.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
+      }
+    }
+    let maxRounds = forceLocal ? runtime.config.maxRounds : runtime.effectiveMaxRounds
     let result = try await ConversationTurn.run(
       messages: &messages,
+      maximumRounds: maxRounds,
+      cancellation: context.cancellation,
       generate: { messages in
         var msgs = messages
         if msgs.count > 1, !memoryBootstrap.isEmpty {
@@ -53,36 +91,37 @@ enum AgentTurn {
             role: .system, content: context.systemPrompt + memoryBootstrap, toolCalls: [],
             toolCallID: nil, name: nil)
         }
-        try context.interaction?.cancellation.check()
+        try context.cancellation.check()
         return try await runtime.generate(
           messages: msgs, tools: context.definitions,
-          interaction: context.interaction, forceLocal: forceLocal)
+          interaction: context.interaction,
+          cancellation: context.cancellation,
+          terminal: context.terminal,
+          forceLocal: forceLocal)
       },
       execute: { parsedCall in
+        try context.cancellation.check()
         // Tool IDs in UI events are unique across generations and subagents.
         let call = ParsedToolCall(
           id: UUID().uuidString, name: parsedCall.name,
           arguments: parsedCall.arguments, argumentsJSON: parsedCall.argumentsJSON)
         if let interaction = context.interaction {
           interaction.tool(call, "pending", nil)
-        } else {
-          printColor("\n● \(call.name)(\(call.argumentSummary))\n", color: "green")
         }
-        let result = await ToolRegistry.execute(call: call, runtime: runtime, context: context)
+        let result = try await ToolRegistry.execute(call: call, runtime: runtime, context: context)
         if let interaction = context.interaction {
           let failed =
             result.hasPrefix("Error") || result.hasPrefix("Tool call denied")
             || interaction.cancellation.isCancelled
           interaction.tool(call, failed ? "failed" : "completed", result)
         } else {
-          AgentTerminal.toolResult(result, limit: resultLimit)
+          AgentTerminal.toolResult(
+            header: "\(call.name)(\(call.argumentSummary))",
+            result: result, limit: resultLimit)
         }
+        try context.cancellation.check()
         return result
       })
-    if messages.count > 1, !memoryBootstrap.isEmpty {
-      messages[0] = GFTokenizer.Message(
-        role: .system, content: context.systemPrompt, toolCalls: [], toolCallID: nil, name: nil)
-    }
     return result
   }
 }
@@ -165,10 +204,11 @@ actor AgentCore: ACPBackend {
     try interaction.cancellation.check()
     if cacheSession != id { runtime.committedTokenIDs.removeAll() }
     cacheSession = id
-    runtime.remainingToolCalls = 64
+    runtime.resetToolBudget()
     let context = AgentToolContext(
       directory: session.directory, systemPrompt: session.config.systemPrompt,
       mcp: session.mcp, definitions: session.definitions ?? [], interaction: interaction,
+      cancellation: interaction.cancellation, terminal: nil,
       memoryService: session.memoryService)
 
     let maxMessages = 30

@@ -1,57 +1,51 @@
 import Foundation
 import TurboFieldfare
 
-enum RoutingMode: String {
-  case auto = "Auto (Hybrid)"
-  case forceLocal = "Local (Embedded)"
-  case forceCloud = "Remote (OpenAI)"
+public enum MetalGemmaError: Error, CustomStringConvertible {
+  case modelNotFound(String)
+
+  public var description: String {
+    switch self {
+    case .modelNotFound(let path):
+      return
+        "Gemma 4 model file not found at \(path). Run 'swift run -c release TurboFieldfareRepack --output scratch/gemma4.gturbo' to install it, or use --backend apple."
+    }
+  }
 }
 
-final class AgentState: @unchecked Sendable {
-  var content = ""
-  var calls: [ParsedToolCall] = []
-}
-
-// MARK: - AgentRuntime
-// Access is serialized by the REPL or AgentCore.
-final class AgentRuntime: @unchecked Sendable {
+final class MetalGemmaBackend: InferenceBackend, @unchecked Sendable {
+  let capabilities: BackendCapabilities
   let context: MetalContext
   let model: Model
   let runner: RealForwardRunner
   let scratch: RawCompletionScratch
   let tokenizer: GFTokenizer
   let config: AgentConfig
-
-  let statusLine = AgentStatusLine()
-
-  var remainingToolCalls = 64
-  var subagentDepth = 0
-
-  var lastStopReason: StopReason = .endOfTurn
-
-  var routingMode: RoutingMode = .auto
-  var openAIClient: OpenAIClient? = OpenAIClient()
+  let statusLine: AgentStatusLine
 
   var committedTokenIDs: [Int32] = []
+  var lastStopReason: StopReason = .endOfTurn
 
-  init(config: AgentConfig) async throws {
+  init(config: AgentConfig, statusLine: AgentStatusLine? = nil) async throws {
     self.config = config
+    self.statusLine = statusLine ?? AgentStatusLine()
 
-    if let rm = config.routingMode {
-      switch rm {
-      case "local": self.routingMode = .forceLocal
-      case "cloud": self.routingMode = .forceCloud
-      case "auto": self.routingMode = .auto
-      default: break
-      }
+    let modelURL: URL
+    if config.args.model == "none" || config.args.model.isEmpty {
+      modelURL = config.defaultModelURL
+    } else {
+      modelURL = URL(fileURLWithPath: config.args.model)
     }
 
-    let modelURL = URL(fileURLWithPath: config.args.model)
+    guard FileManager.default.fileExists(atPath: modelURL.path) else {
+      throw MetalGemmaError.modelNotFound(modelURL.path)
+    }
+
     self.context = try MetalContext()
     let runtime = try config.args.resolvedRuntimeConfiguration(
       forceLogitsHead: true, imagePrompt: false)
 
-    printColor("Loading Gemma 4 Agent from \(config.args.model)...\n", color: "blue")
+    printColor("Loading Gemma 4 Agent from \(modelURL.path)...\n", color: "blue")
 
     self.model = try Model.load(
       directoryURL: modelURL,
@@ -68,91 +62,51 @@ final class AgentRuntime: @unchecked Sendable {
 
     self.scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize)
     self.tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
+
+    self.capabilities = BackendCapabilities(
+      name: "Metal Gemma 4 26B-A4B",
+      supportsTools: true,
+      supportsStreaming: true,
+      maxContextLength: config.args.maxContext,
+      isOnDevice: true,
+      isPrivateCloudCompute: false
+    )
   }
 
   func generate(
     messages: [GFTokenizer.Message],
-    tools: [GFTokenizer.FunctionDefinition]? = nil,
-    interaction: AgentInteraction? = nil, forceLocal: Bool = false
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
-    let definitions = tools ?? ToolRegistry.definitions
+    return try await generateLocally(
+      messages: messages,
+      tools: tools,
+      interaction: interaction
+    )
+  }
 
-    var target: RouteTarget = .local
-    if forceLocal {
-      target = .local
-    } else {
-      switch routingMode {
-      case .forceLocal:
-        target = .local
-      case .forceCloud:
-        target = .cloud
-      case .auto:
-        let router = HybridRouter(localRuntime: self, cloudClient: openAIClient)
-        target = try await router.decide(messages: messages)
-      }
-    }
-
-    if target == .cloud, let client = openAIClient {
-      if interaction == nil {
-        terminalPrint("\n\u{001B}[33m[Auto-Routed to Cloud (OpenAI)]\u{001B}[0m\n")
-      }
-
-      let cancellation = interaction?.cancellation ?? AgentCancellation()
-      let terminal = (interaction == nil) ? TerminalGeneration(cancellation: cancellation) : nil
-
-      do {
-        let result = try await client.generate(messages: messages, tools: definitions)
-
-        if let interaction {
-          interaction.text(result.content)
-        } else {
-          terminal?.text(result.content)
-        }
-
-        await terminal?.finish()
-        lastStopReason = .endOfTurn
-        return result
-      } catch {
-        await terminal?.finish()
-        if interaction == nil {
-          terminalPrint(
-            "\n\u{001B}[31m[Cloud route failed: \(error). Falling back to Local...]\u{001B}[0m\n")
-        }
-        return try await generateLocally(
-          messages: messages, tools: definitions, interaction: interaction)
-      }
-    } else {
-      if routingMode == .auto && interaction == nil {
-        terminalPrint("\n\u{001B}[32m[Auto-Routed to Local (Embedded)]\u{001B}[0m\n")
-      }
-      do {
-        return try await generateLocally(
-          messages: messages, tools: definitions, interaction: interaction)
-      } catch {
-        if let client = openAIClient {
-          if interaction == nil {
-            terminalPrint(
-              "\n\u{001B}[31m[Local route failed: \(error). Falling back to Cloud...]\u{001B}[0m\n")
-          }
-          let result = try await client.generate(messages: messages, tools: definitions)
-          if interaction == nil {
-            terminalPrint(result.content)
-          } else {
-            interaction?.text(result.content)
-          }
-          lastStopReason = .endOfTurn
-          return result
-        } else {
-          throw error
-        }
-      }
-    }
+  func generate(
+    messages: [GFTokenizer.Message],
+    tools: [GFTokenizer.FunctionDefinition]?,
+    interaction: AgentInteraction?,
+    cancellation: AgentCancellation?,
+    terminal: TerminalGeneration?
+  ) async throws -> (content: String, calls: [ParsedToolCall]) {
+    return try await generateLocally(
+      messages: messages,
+      tools: tools,
+      interaction: interaction,
+      cancellation: cancellation,
+      terminal: terminal
+    )
   }
 
   func generateLocally(
     messages: [GFTokenizer.Message],
     tools: [GFTokenizer.FunctionDefinition]? = nil,
     interaction: AgentInteraction? = nil,
+    cancellation: AgentCancellation? = nil,
+    terminal: TerminalGeneration? = nil,
     maxNewTokensOverride: Int? = nil,
     silent: Bool = false
   ) async throws -> (content: String, calls: [ParsedToolCall]) {
@@ -169,15 +123,30 @@ final class AgentRuntime: @unchecked Sendable {
 
     if !silent { committedTokenIDs.removeAll(keepingCapacity: true) }
     let decoder = StructuredAssistantDecoder(
-      tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }))
+      tokenizer: tokenizer, allowedTools: Set(definitions.map { $0.name }), emitThoughts: true)
 
     if interaction == nil && !silent { statusLine.beginGeneration(contextTokens: cachedTokens) }
     let state = AgentState()
-    let cancellation = interaction?.cancellation ?? AgentCancellation()
+    let effectiveCancellation = interaction?.cancellation ?? cancellation ?? AgentCancellation()
     let stopAfterTool = AgentCancellation()
-    let terminal =
-      (interaction == nil && !silent) ? TerminalGeneration(cancellation: cancellation) : nil
-    defer { terminal?.restore() }
+    let activeTerminal: TerminalGeneration?
+    let ownsTerminal: Bool
+    if interaction == nil && !silent {
+      if let terminal {
+        activeTerminal = terminal
+        ownsTerminal = false
+        terminal.beginGeneration()
+      } else {
+        activeTerminal = TerminalGeneration(cancellation: effectiveCancellation)
+        ownsTerminal = true
+      }
+    } else {
+      activeTerminal = nil
+      ownsTerminal = false
+    }
+    defer {
+      if ownsTerminal { activeTerminal?.restore() }
+    }
 
     func handleDecoderEvents(_ events: [StructuredAssistantEvent]) {
       for event in events {
@@ -185,11 +154,11 @@ final class AgentRuntime: @unchecked Sendable {
         case .content(let text):
           state.content += text
           if !silent {
-            if let interaction { interaction.text(text) } else { terminal?.text(text) }
+            if let interaction { interaction.text(text) } else { activeTerminal?.text(text) }
           }
         case .thought(let text):
           if !silent {
-            terminal?.thought(text)
+            activeTerminal?.thought(text)
           }
         case .toolCall(let call):
           state.calls.append(call)
@@ -217,7 +186,9 @@ final class AgentRuntime: @unchecked Sendable {
         context: context,
         scratch: scratch,
         start: start,
-        shouldStop: { stopAfterTool.isCancelled || cancellation.isCancelled || Task.isCancelled },
+        shouldStop: {
+          stopAfterTool.isCancelled || effectiveCancellation.isCancelled || Task.isCancelled
+        },
         onProgress: { event in
           switch event {
           case .prefill(let done, _):
@@ -234,14 +205,14 @@ final class AgentRuntime: @unchecked Sendable {
       )
     } catch {
       if !silent {
-        await terminal?.finish()
+        await activeTerminal?.finishGeneration()
         statusLine.snapshot.phase = "Error"
         statusLine.refresh(force: true)
       }
       throw error
     }
 
-    if !silent { await terminal?.finish() }
+    if !silent { await activeTerminal?.finishGeneration() }
     _ = try? decoder.finish()
 
     if interaction == nil && !silent {
@@ -252,7 +223,7 @@ final class AgentRuntime: @unchecked Sendable {
 
     if !silent {
       lastStopReason = result.reason
-      if interaction?.cancellation.isCancelled == true || Task.isCancelled {
+      if effectiveCancellation.isCancelled || result.reason == .cancelled || Task.isCancelled {
         committedTokenIDs.removeAll()
         throw CancellationError()
       }

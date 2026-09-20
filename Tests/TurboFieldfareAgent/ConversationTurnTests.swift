@@ -55,6 +55,80 @@ final class ConversationTurnTests: XCTestCase, @unchecked Sendable {
     }
   }
 
+  func testCancellationPropagatesImmediatelyWithoutExecutingToolsOrRetrying() async {
+    var messages = [
+      GFTokenizer.Message(role: .user, content: "task", toolCalls: [], toolCallID: nil, name: nil)
+    ]
+    var executedTools = 0
+    var generateCalls = 0
+    do {
+      _ = try await ConversationTurn.run(
+        messages: &messages,
+        generate: { _ in
+          generateCalls += 1
+          throw CancellationError()
+        },
+        execute: { _ in
+          executedTools += 1
+          return ""
+        })
+      XCTFail("Expected CancellationError")
+    } catch {
+      XCTAssertTrue(error is CancellationError)
+      XCTAssertEqual(generateCalls, 1)
+      XCTAssertEqual(executedTools, 0)
+      XCTAssertEqual(messages.count, 1)
+      XCTAssertEqual(messages.first?.role, .user)
+    }
+  }
+
+  func testToolExecutionCancellationStopsTurnImmediatelyWithoutRunningFurtherToolsOrRounds() async {
+    let cancellation = AgentCancellation()
+    var messages = [
+      GFTokenizer.Message(role: .user, content: "task", toolCalls: [], toolCallID: nil, name: nil)
+    ]
+    var executedTools: [String] = []
+    var generateCalls = 0
+    do {
+      _ = try await ConversationTurn.run(
+        messages: &messages,
+        maximumRounds: 5,
+        cancellation: cancellation,
+        generate: { _ in
+          generateCalls += 1
+          return ("", [self.call("tool1", id: "1"), self.call("tool2", id: "2")])
+        },
+        execute: { call in
+          executedTools.append(call.name)
+          if call.name == "tool1" {
+            cancellation.cancel()
+            throw CancellationError()
+          }
+          return "ok"
+        })
+      XCTFail("Expected CancellationError")
+    } catch {
+      XCTAssertTrue(error is CancellationError)
+      XCTAssertEqual(generateCalls, 1)
+      XCTAssertEqual(executedTools, ["tool1"])
+    }
+  }
+
+  func testAgentCancellationOnCancelCallbacks() {
+    final class Box: @unchecked Sendable {
+      var value = false
+    }
+    let token = AgentCancellation()
+    let box1 = Box()
+    let box2 = Box()
+    token.onCancel { box1.value = true }
+    XCTAssertFalse(box1.value)
+    token.cancel()
+    XCTAssertTrue(box1.value)
+    token.onCancel { box2.value = true }
+    XCTAssertTrue(box2.value)
+  }
+
   func testToolSummaryUsesPreferredArgumentAndCapsLength() {
     let call = ParsedToolCall(
       id: "1", name: "shell",
